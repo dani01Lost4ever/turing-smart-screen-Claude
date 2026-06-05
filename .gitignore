@@ -140,5 +140,10 @@ dmypy.json
 screencap.png
 tmp
 
+# Claude Code status widget artifacts (regenerable from --preview / test_revision.py)
+preview_*.png
+revtest.png
+_blit.png
+
 version.txt
 external/LibreHardwareMonitor/LibreHardwareMonitorLib.sys
