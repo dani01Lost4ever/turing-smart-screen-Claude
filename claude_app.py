@@ -22,12 +22,12 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPixmap
 from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkReply, QNetworkRequest)
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDockWidget,
                                 QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                 QLabel, QMainWindow, QMessageBox, QPushButton,
-                                QScrollArea, QSpinBox, QToolBar, QVBoxLayout,
+                                QScrollArea, QSpinBox, QStyle, QToolBar, QVBoxLayout,
                                 QWidget)
 
 import claude_screen as cs
@@ -69,6 +69,36 @@ def reset_theme():
 # Palette knobs the settings panel exposes. Order = display order.
 PALETTE_KEYS = ("BG", "FG", "MUTED", "TRACK", "CORAL", "GREEN", "AMBER", "RED")
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+class NoScrollSpinBox(QSpinBox):
+    """QSpinBox that ignores wheel events unless explicitly focused. Stops the spinbox
+    from eating the parent ScrollArea's scroll and silently bumping values when you
+    hover-scroll past it. To change the value: click first, then scroll/arrow/type."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoScrollComboBox(QComboBox):
+    """Same wheel-protection rule as NoScrollSpinBox, for the weekday selector."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 def pil_to_qpixmap(img):
@@ -186,13 +216,13 @@ class SettingsPanel(QWidget):
         # Weekly reset (weekday + hour, in WEEKLY_TZ_NAME local time)
         gb = QGroupBox(f"Weekly reset ({cs.WEEKLY_TZ_NAME})")
         f = QFormLayout(gb)
-        self._wd = QComboBox()
+        self._wd = NoScrollComboBox()
         self._wd.addItems(WEEKDAYS)
         self._wd.setCurrentIndex(cs.WEEKLY_RESET_WEEKDAY)
         self._wd.currentIndexChanged.connect(self._on_weekday)
         f.addRow("Day", self._wd)
 
-        self._hr = QSpinBox()
+        self._hr = NoScrollSpinBox()
         self._hr.setRange(0, 23)
         self._hr.setSuffix(":00")
         self._hr.setValue(cs.WEEKLY_RESET_HOUR)
@@ -203,7 +233,7 @@ class SettingsPanel(QWidget):
         # Weekly budget (re-calibration without editing code)
         gb = QGroupBox("Weekly token budget")
         f = QFormLayout(gb)
-        self._budget = QSpinBox()
+        self._budget = NoScrollSpinBox()
         self._budget.setRange(1, 1_000_000_000)
         self._budget.setSingleStep(1_000_000)
         self._budget.setSuffix(" tokens")
@@ -216,7 +246,7 @@ class SettingsPanel(QWidget):
         # Panel brightness (only meaningful when panel push is on; harmless otherwise)
         gb = QGroupBox("Panel brightness")
         f = QFormLayout(gb)
-        self._bright = QSpinBox()
+        self._bright = NoScrollSpinBox()
         self._bright.setRange(0, 100)
         self._bright.setSuffix(" %")
         self._bright.setValue(cs.BRIGHTNESS)
@@ -509,10 +539,28 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda _checked=False, s=state: self.preview.set_override_state(s))
             m.addAction(a)
 
-        # Toolbar: panel push toggle
+        # Toolbar: Save / Undo / Redo / panel toggle
         self.panel = PanelController()
         tb = QToolBar("Main")
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
+        style = self.style()
+        self._act_save = QAction(style.standardIcon(QStyle.SP_DialogSaveButton), "Save", self)
+        self._act_save.setShortcut(QKeySequence.Save)                       # Ctrl+S
+        self._act_save.triggered.connect(self._save)
+        self._act_save.setEnabled(False)                                     # nothing to save yet
+        tb.addAction(self._act_save)
+        self._act_undo = QAction(style.standardIcon(QStyle.SP_ArrowBack), "Undo", self)
+        self._act_undo.setShortcut(QKeySequence.Undo)                       # Ctrl+Z
+        self._act_undo.triggered.connect(self._undo)
+        self._act_undo.setEnabled(False)
+        tb.addAction(self._act_undo)
+        self._act_redo = QAction(style.standardIcon(QStyle.SP_ArrowForward), "Redo", self)
+        self._act_redo.setShortcut(QKeySequence.Redo)                       # Ctrl+Y / Ctrl+Shift+Z
+        self._act_redo.triggered.connect(self._redo)
+        self._act_redo.setEnabled(False)
+        tb.addAction(self._act_redo)
+        tb.addSeparator()
         self._panel_action = QAction("Connect to panel", self, checkable=True)
         self._panel_action.toggled.connect(self._toggle_panel)
         tb.addAction(self._panel_action)
@@ -544,7 +592,8 @@ class MainWindow(QMainWindow):
             a.triggered.connect(slot)
             tm.addAction(a)
 
-        # Auto-load the last-saved theme on startup
+        # Auto-load the last-saved theme on startup (settings panel is the source of truth
+        # after this point; nothing is written back to disk until Save is hit)
         if DEFAULT_THEME_PATH.exists():
             try:
                 load_theme(DEFAULT_THEME_PATH)
@@ -552,8 +601,16 @@ class MainWindow(QMainWindow):
                 self.preview.force_usage_refresh()
             except Exception as e:
                 print(f"warning: could not load theme {DEFAULT_THEME_PATH}: {e}", file=sys.stderr)
-        # Auto-save on any change
-        self.settings.changed.connect(lambda: save_theme(DEFAULT_THEME_PATH))
+
+        # Undo/redo + dirty tracking. _baseline is the on-disk-saved state; _last is the
+        # state we'd revert to if the next change happened (== current state right now).
+        self._baseline = self._snapshot()
+        self._last = self._snapshot()
+        self._undo_stack = []
+        self._redo_stack = []
+        self._update_title()
+        # Wire AFTER initial sync so we don't snapshot a no-op
+        self.settings.changed.connect(self._on_settings_changed)
 
         self.statusBar().showMessage("Ready - state follows ~/.claude/claude-screen-state.json")
         self.resize(860, 460)
@@ -606,10 +663,84 @@ class MainWindow(QMainWindow):
         reset_theme()
         self.settings.reload_from_globals()
         self.preview.force_usage_refresh()
+        # Reset behaves like any other change: undoable, dirty, NOT auto-saved
+        self._on_settings_changed()
+        self.statusBar().showMessage("Theme reset (Ctrl+S to keep, Ctrl+Z to undo)", 5000)
+
+    # ---- undo / redo / save plumbing ------------------------------------------------
+
+    def _snapshot(self):
+        """Capture the current claude_screen.* globals that the theme owns."""
+        return {k: getattr(cs, k) for k in THEME_KEYS}
+
+    def _apply_snapshot(self, snap):
+        """Reverse direction: push the snapshot back into globals + refresh UI WITHOUT
+        firing the settings.changed signal (reload_from_globals uses blockSignals)."""
+        for k, v in snap.items():
+            setattr(cs, k, tuple(v) if isinstance(v, list) else v)
+        self.settings.reload_from_globals()
+        self.preview.force_usage_refresh()
+
+    def _on_settings_changed(self):
+        """Wired to SettingsPanel.changed. Records the previous state for undo."""
+        self._undo_stack.append(self._last)
+        if len(self._undo_stack) > 100:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._last = self._snapshot()
+        self._update_title()
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        snap = self._undo_stack.pop()
+        self._apply_snapshot(snap)
+        self._last = snap
+        self._update_title()
+        self.statusBar().showMessage("Undone", 2000)
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        snap = self._redo_stack.pop()
+        self._apply_snapshot(snap)
+        self._last = snap
+        self._update_title()
+        self.statusBar().showMessage("Redone", 2000)
+
+    def _save(self):
         save_theme(DEFAULT_THEME_PATH)
-        self.statusBar().showMessage("Theme reset to defaults", 5000)
+        self._baseline = self._snapshot()
+        self._update_title()
+        self.statusBar().showMessage(f"Saved -> {DEFAULT_THEME_PATH}", 5000)
+
+    @property
+    def _dirty(self):
+        return self._snapshot() != self._baseline
+
+    def _update_title(self):
+        base = "Claude Status Buddy"
+        self.setWindowTitle(f"• {base}" if self._dirty else base)
+        self._act_save.setEnabled(self._dirty)
+        self._act_undo.setEnabled(bool(self._undo_stack))
+        self._act_redo.setEnabled(bool(self._redo_stack))
 
     def closeEvent(self, event):
+        # Prompt if there are unsaved theme changes
+        if self._dirty:
+            choice = QMessageBox.question(
+                self, "Unsaved changes",
+                "You have unsaved theme changes. Save before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if choice == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if choice == QMessageBox.Save:
+                self._save()
         # Release the panel cleanly so it doesn't freeze on the last frame
         if self.panel.connected:
             self.panel.disconnect_panel()
