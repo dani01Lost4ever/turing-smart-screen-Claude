@@ -35,7 +35,8 @@ import claude_screen as cs
 
 # Settings persisted to disk (read by load_theme, written by save_theme).
 THEME_KEYS = ("BG", "FG", "MUTED", "TRACK", "CORAL", "GREEN", "AMBER", "RED",
-              "WEEKLY_RESET_WEEKDAY", "WEEKLY_RESET_HOUR", "WEEKLY_TOKEN_BUDGET",
+              "WEEKLY_RESET_WEEKDAY", "WEEKLY_RESET_HOUR",
+              "SESSION_TOKEN_BUDGET", "WEEKLY_TOKEN_BUDGET",
               "BRIGHTNESS")
 # Snapshot defaults at import time so Reset can restore them.
 THEME_DEFAULTS = {k: getattr(cs, k) for k in THEME_KEYS}
@@ -230,9 +231,19 @@ class SettingsPanel(QWidget):
         f.addRow("Hour", self._hr)
         outer.addWidget(gb)
 
-        # Weekly budget (re-calibration without editing code)
-        gb = QGroupBox("Weekly token budget")
+        # Token budgets (re-calibration without editing code). Formula:
+        # new_budget = old_budget * (screen% / real% from Claude's /usage).
+        gb = QGroupBox("Token budgets (calibration)")
         f = QFormLayout(gb)
+        self._sbudget = NoScrollSpinBox()
+        self._sbudget.setRange(1, 1_000_000_000)
+        self._sbudget.setSingleStep(500_000)
+        self._sbudget.setSuffix(" tokens")
+        self._sbudget.setGroupSeparatorShown(True)
+        self._sbudget.setValue(cs.SESSION_TOKEN_BUDGET)
+        self._sbudget.valueChanged.connect(self._on_session_budget)
+        f.addRow("5h session", self._sbudget)
+
         self._budget = NoScrollSpinBox()
         self._budget.setRange(1, 1_000_000_000)
         self._budget.setSingleStep(1_000_000)
@@ -240,7 +251,7 @@ class SettingsPanel(QWidget):
         self._budget.setGroupSeparatorShown(True)
         self._budget.setValue(cs.WEEKLY_TOKEN_BUDGET)
         self._budget.valueChanged.connect(self._on_budget)
-        f.addRow("Budget", self._budget)
+        f.addRow("Weekly", self._budget)
         outer.addWidget(gb)
 
         # Panel brightness (only meaningful when panel push is on; harmless otherwise)
@@ -271,6 +282,11 @@ class SettingsPanel(QWidget):
         self.weeklyChanged.emit()
         self.changed.emit()
 
+    def _on_session_budget(self, b):
+        cs.SESSION_TOKEN_BUDGET = b
+        self.weeklyChanged.emit()            # forces a usage recompute so the gauge updates now
+        self.changed.emit()
+
     def _on_brightness(self, b):
         cs.BRIGHTNESS = b
         self.changed.emit()
@@ -281,10 +297,11 @@ class SettingsPanel(QWidget):
         signals. Used after loading a theme so we don't spuriously re-save / recompute."""
         for sw in self._swatches:
             sw._refresh()
-        self._wd.blockSignals(True);     self._wd.setCurrentIndex(cs.WEEKLY_RESET_WEEKDAY); self._wd.blockSignals(False)
-        self._hr.blockSignals(True);     self._hr.setValue(cs.WEEKLY_RESET_HOUR);            self._hr.blockSignals(False)
-        self._budget.blockSignals(True); self._budget.setValue(cs.WEEKLY_TOKEN_BUDGET);      self._budget.blockSignals(False)
-        self._bright.blockSignals(True); self._bright.setValue(cs.BRIGHTNESS);                self._bright.blockSignals(False)
+        self._wd.blockSignals(True);      self._wd.setCurrentIndex(cs.WEEKLY_RESET_WEEKDAY);  self._wd.blockSignals(False)
+        self._hr.blockSignals(True);      self._hr.setValue(cs.WEEKLY_RESET_HOUR);             self._hr.blockSignals(False)
+        self._sbudget.blockSignals(True); self._sbudget.setValue(cs.SESSION_TOKEN_BUDGET);     self._sbudget.blockSignals(False)
+        self._budget.blockSignals(True);  self._budget.setValue(cs.WEEKLY_TOKEN_BUDGET);       self._budget.blockSignals(False)
+        self._bright.blockSignals(True);  self._bright.setValue(cs.BRIGHTNESS);                self._bright.blockSignals(False)
 
 
 # Atlassian Statuspage indicator -> RGB. See https://status.claude.com/api/v2/summary.json.

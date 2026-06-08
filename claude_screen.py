@@ -42,10 +42,11 @@ PLAN = "max20"                        # pro | max5 | max20 | custom  (your Claud
 # Fallback budgets (used only if claude-monitor isn't installed). The weekly gauge always
 # uses the local parser below, since claude-monitor doesn't model the weekly cap.
 SESSION_WINDOW_HRS = 5
-SESSION_TOKEN_BUDGET = 7_000_000      # session fallback only (8M * 74/85 ~= 7M)
 # Re-calibrate when the screen % drifts from Claude Code's /usage %:
 #   new_budget = old_budget * (screen% / real%)
-# 2026-06-05 calibration: widget 26.3M tokens vs Claude reporting 45% -> 58M.
+# 2026-06-05: widget 26.3M tokens vs Claude reporting 45% -> WEEKLY=58M.
+# 2026-06-08: widget 1.94M tokens vs Claude reporting 10% on 5h -> SESSION=19M.
+SESSION_TOKEN_BUDGET = 19_000_000     # session fallback (used when claude-monitor isn't installed)
 WEEKLY_TOKEN_BUDGET = 58_000_000      # weekly, local parser (fixed-window calibrated)
 
 # Anthropic's weekly cap resets at a FIXED weekday + local hour (set yours below; find it in
