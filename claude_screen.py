@@ -32,6 +32,8 @@ BRIGHTNESS = 50                # 0-100 (rev A can run hot - keep <= 50%)
 FRAME_SEC = 0.03           # animation pacing (panel serial throughput is the real limiter)
 USAGE_REFRESH_SEC = 20     # recompute token usage this often (triggers one full redraw)
 STATS_REFRESH_SEC = 300    # recompute the heavy footer stats this often (off the render loop)
+CLAUDE_STATUS_URL = "https://status.claude.com/api/v2/summary.json"
+CLAUDE_STATUS_REFRESH_SEC = 60   # poll the Anthropic status page this often
 
 # --- Session gauge: auto-calibrated via claude-monitor (P90 dynamic limit) if available ---
 USE_CLAUDE_MONITOR = True             # pip install claude-monitor ; falls back to budget below
@@ -386,6 +388,43 @@ def _stats_loop(interval):
         time.sleep(interval)
 
 
+# Claude services status (status.claude.com summary) — drawn in the top-right of the
+# dashboard as a small status chip. Set by _claude_status_loop (daemon) AND by the
+# GUI app's StatusPanel; whichever updates more recently wins.
+_CLAUDE_STATUS = None        # {"indicator": "none|minor|major|critical|maintenance", ...}
+
+# (label, color) per Atlassian status-page indicator
+INDICATOR_CHIPS = {
+    "none":        ("OK",     GREEN),
+    "minor":       ("MINOR",  AMBER),
+    "major":       ("MAJOR",  CORAL),
+    "critical":    ("DOWN",   RED),
+    "maintenance": ("MAINT",  MUTED),
+}
+
+
+def _claude_status_loop(interval=CLAUDE_STATUS_REFRESH_SEC):
+    """Daemon-side background fetcher for status.claude.com. Uses urllib (stdlib) so
+    the daemon doesn't depend on Qt or requests. The GUI app does its own fetch and
+    writes to the same _CLAUDE_STATUS global, so both can run concurrently."""
+    global _CLAUDE_STATUS
+    import urllib.request
+    while True:
+        try:
+            req = urllib.request.Request(CLAUDE_STATUS_URL,
+                                          headers={"User-Agent": "ClaudeStatusBuddy/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            st = data.get("status") or {}
+            _CLAUDE_STATUS = {
+                "indicator": st.get("indicator", "none"),
+                "description": st.get("description", ""),
+            }
+        except Exception:
+            pass                # transient network issue; keep last good
+        time.sleep(interval)
+
+
 def fmt_dur(td):
     s = int(td.total_seconds())
     if s <= 0:
@@ -584,6 +623,25 @@ def draw_stats(d, stats, F):
         d.text((cx, 270), val, font=F["statbig"], fill=FG)
 
 
+def draw_claude_status(d, F):
+    """Top-right status chip: 'STATUS' caption + colored dot + indicator word.
+    No-op when _CLAUDE_STATUS hasn't been populated yet (first launch / no network)."""
+    if not _CLAUDE_STATUS:
+        return
+    ind = _CLAUDE_STATUS.get("indicator", "none")
+    label, color = INDICATOR_CHIPS.get(ind, ("?", MUTED))
+    right = WIDTH - 12
+    cap_w = d.textlength("STATUS", font=F["tiny"])
+    d.text((right - cap_w, 22), "STATUS", font=F["tiny"], fill=MUTED)
+    val_w = d.textlength(label, font=F["stat"])
+    dot_size, gap = 9, 6
+    text_x = right - val_w
+    dot_x = text_x - gap - dot_size
+    val_y = 36
+    d.ellipse([dot_x, val_y + 5, dot_x + dot_size, val_y + 5 + dot_size], fill=color)
+    d.text((text_x, val_y), label, font=F["stat"], fill=color)
+
+
 def render_buddy_tile(t, state):
     """Just the buddy's patch (over plain background) - this is what streams each tick."""
     lx, ly, tw, th = BUDDY_TILE
@@ -605,6 +663,8 @@ def render_frame(t, usage, state):
     status_line = {"working": "working...", "attention": "needs you!", "idle": "idle"}[state]
     sc = RED if state == "attention" else (CORAL if state == "working" else MUTED)
     d.text((176, 52), status_line, font=F["small"], fill=sc)
+
+    draw_claude_status(d, F)                                       # status.claude.com chip (top-right)
 
     gx, gw = 176, WIDTH - 176 - 28                                 # gauges (right)
     draw_gauge(d, gx, 86, gw, "5h session", usage["session_pct"],
@@ -748,6 +808,7 @@ def run_daemon():
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))          # so stop_widget.bat can find us
     threading.Thread(target=_stats_loop, args=(STATS_REFRESH_SEC,), daemon=True).start()
+    threading.Thread(target=_claude_status_loop, daemon=True).start()
     t0 = time.time()
     usage = compute_usage()
     last_usage = t0

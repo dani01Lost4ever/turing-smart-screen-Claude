@@ -369,6 +369,8 @@ class StatusPanel(QWidget):
         st = data.get("status") or {}
         ind = st.get("indicator", "none")
         desc = st.get("description", "Unknown")
+        # share with the renderer so the dashboard + panel show the status chip too
+        cs._CLAUDE_STATUS = {"indicator": ind, "description": desc}
         r, g, b = INDICATOR_COLORS.get(ind, (118, 118, 128))
         self._indicator.setText(
             f'<span style="color: rgb({r},{g},{b}); font-size:18px;">●</span> '
