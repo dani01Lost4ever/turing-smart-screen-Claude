@@ -1,131 +1,104 @@
-# ![Icon](https://raw.githubusercontent.com/mathoudebine/turing-smart-screen-python/main/res/icons/monitor-icon-17865/24.png) turing-smart-screen-python
+# Claude Code Status Buddy
 
-> [!WARNING]
-> 
-> This project is **not affiliated, associated, authorized, endorsed by, or in any way officially connected with Turing / XuanFang / Kipye brands**, or any of theirs subsidiaries, affiliates, manufacturers or sellers of their products. All product and company names are the registered trademarks of their original owners.
-> 
-> This project is an open-source alternative software, NOT the original software provided for the smart screens. **Please do not open issues for USBMonitor.exe/ExtendScreen.exe or for the smart screens hardware here**.
-> * for Turing Smart Screen, use the official forum here: http://discuz.turzx.com/
-> * for other smart screens, contact your reseller
+A tiny desktop companion (and physical USB-panel widget) that shows your **Claude Code usage at a glance** — the exact same numbers `/usage` reports — with a pixel mascot that reacts to what Claude is doing.
 
-![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black) ![Windows](https://img.shields.io/badge/Windows%2010%2F11-0078D6?style=for-the-badge&logoColor=white&logo=data:image/svg%2bxml;base64,PHN2ZyByb2xlPSJpbWciIHZpZXdCb3g9IjAgMCAyNCAyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48dGl0bGU+V2luZG93czwvdGl0bGU+PHBhdGggZmlsbCA9ICIjRkZGRkZGIiBkPSJNMCwwSDExLjM3N1YxMS4zNzJIMFpNMTIuNjIzLDBIMjRWMTEuMzcySDEyLjYyM1pNMCwxMi42MjNIMTEuMzc3VjI0SDBabTEyLjYyMywwSDI0VjI0SDEyLjYyMyIvPjwvc3ZnPg==) [![macOS](https://img.shields.io/badge/mac%20os%20(⚠️major%20bug)-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/mathoudebine/turing-smart-screen-python/issues/7) ![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?style=for-the-badge&logo=Raspberry%20Pi&logoColor=white) ![Python](https://img.shields.io/badge/Python-3.X-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54) [![Licence](https://img.shields.io/github/license/mathoudebine/turing-smart-screen-python?style=for-the-badge)](./LICENSE)
-  
-A Python system monitor program and an abstraction library for **small IPS USB-C displays.**    
+![Claude Status Buddy app UI](docs/app-ui.png)
 
-Supported operating systems : macOS, Windows, Linux (incl. Raspberry Pi), basically all OS that support Python 3.9+  
+It answers the two questions you keep asking mid-session: *how much of my 5-hour and weekly limits have I burned, and is Claude waiting on me?* The 5h / weekly gauges read straight from Anthropic's usage endpoint, and the buddy flips to a flashing **"NEEDS YOU"** alert the moment Claude asks you a question.
 
-### ✅ Supported smart screens models:
+> Originally a fork of [mathoudebine/turing-smart-screen-python](https://github.com/mathoudebine/turing-smart-screen-python) (GPLv3). The upstream USB-panel driver (`library/lcd/`) is reused to push frames to a Turing 3.5" screen; everything else here is purpose-built for Claude Code.
 
-| ✅ Turing Smart Screen / TURZX                                                                                                                                                                                                                                                                                                                                                                  |
-|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="res/docs/turing.webp" width="30%" height="30%"/> <img src="res/docs/turing46inch.png" width="30%" height="30%"/> <img src="res/docs/turing5inch.png" width="30%" height="30%"/> <br/> <img src="res/docs/turing2inch.webp" width="30%" height="30%"/> <img src="res/docs/turing8inch.png" width="30%" height="30%"/> <img src="res/docs/turing8inch.webp" width="30%" height="30%"/> |
-| All available sizes and hardware revisions supported: **2.1" / 2.8" / 3.5" / 4.6" / 5" / 5.2" / 8.0" / 8.8" / 9.2" / 12.3"** <br/>UART and USB protocols supported. Note: no video or storage support for now                                                                                                                                                                                  |
+---
 
-| ✅ XuanFang 3.5"                                   | ✅ [UsbPCMonitor 3.5" / 5"](https://aliexpress.com/item/1005003931363455.html)                       | ✅ Kipye Qiye Smart Display 3.5"                                                  |
-|---------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
-| <img src="res/docs/xuanfang.webp"/>               | <img src="res/docs/UsbPCMonitor_5inch.webp" width="60%" height="60%"/>                              | <img src="res/docs/kipye-qiye-35.webp" width="60%" height="60%"/>                |
-| revision B & flagship (with backplate & RGB LEDs) | Unknown manufacturer, visually similar to Turing 3.5" / 5". Original software is `UsbPCMonitor.exe` | Front panel has an engraved inscription "奇叶智显" Qiye Zhixian (Qiye Smart Display) |
+## What it shows
 
-| ✅ WeAct Studio Display FS V1 0.96"                            | ✅ WeAct Studio Display FS V1 3.5"                            |
-|---------------------------------------------------------------|--------------------------------------------------------------|
-| <img src="res/docs/weact_0.96.jpg" width="60%" height="60%"/> | <img src="res/docs/weact_3.5.png" width="60%" height="60%"/> |
+- **5h session & weekly gauges** — exact utilization percentages and reset countdowns, pulled from `https://api.anthropic.com/api/oauth/usage` (the data behind `/usage`), polled ~once a minute. If that's ever unreachable it falls back to estimating from local logs and labels the value `(est)`.
+- **The buddy** — a clay-colored mascot that is **working** (active), **idle** (calm), or **attention** (flashing alert when Claude needs your input). Driven by Claude Code lifecycle hooks.
+- **Confetti** 🎉 when a limit resets.
+- **status.claude.com strip** — overall health + per-component dots (claude.ai, Console, API, Code, …), live from the Statuspage API.
+- **Session stats** — current streak, favorite model, and a usage heatmap, parsed from your local `~/.claude/projects/**/*.jsonl`.
 
-<details>
+## Two ways to run it
 
-<summary><h3>❌ Not (yet) supported / not tested smart screen models</h3></summary>
+### 1. Desktop app (`claude_app.py`)
+A PySide6 window with a live preview, a **State** override menu, a **Theme** editor (palette, weekly-reset anchor, token-budget calibration, brightness) with Save / Undo / Redo, the status strip, and an optional **Connect to panel** toggle to drive the physical screen.
 
-| ❔ _AIDA64 / AX206 / USB2LCD..._                                                                                                                                                                        | ❔ _[ACEMAGIC S1 Mini PC - integrated 1,9″ display](https://acemagic.com/products/acemagic-s1-12th-alder-laker-n95-mini-pc)_                                  |
-|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="res/docs/ax206.jpg" width="45%" height="45%" /> <img src="res/docs/geekteches_ad35.jpg" width="45%" height="45%" /> <br/> <img src="res/docs/smartcool_lcd.webp" width="45%" height="45%" /> | <img src="res/docs/acemagic-s1-mini.jpg"/>                                                                                                                   |
-| Not supported for now. Produced by multiple manufacturers, all use the same [Appotech AX206 hacked photo frame firmware](https://github.com/dreamlayers/dpf-ax). Supported by AIDA64 and lcd4linux     | Not supported for now but could be integrated: protocol has been decoded, [see here](https://github.com/mathoudebine/turing-smart-screen-python/issues/677). |
+```bat
+start_app.bat            REM or:  pyw -3.13 claude_app.py
+```
 
-| ❔ _NXElec BeadaPanel 3/4/5/6/7_                                                                                                                                                                                                                                                                                           |
-|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="res/docs/beadapanel-3.jpg" width="30%" height="30%" /> <img src="res/docs/beadapanel-5s.jpg" width="30%" height="30%" /> <img src="res/docs/beadapanel-6.jpg" width="30%" height="30%" />                                                                                                                       |
-| Not supported for now but could be integrated: [Pankel-Link V1.0 Protocol Specification](https://www.nxelec.com/documents/bp/Panel-Link_USB_Media_Stream_Transport_Protocol_Rev10.pdf) / [Status-Link V1.1 Protocol Specification](https://www.nxelec.com/documents/bp/Status-Link_USB_Panel_Control_Protocol_Rev11.pdf). |
+### 2. Physical Turing USB panel (`claude_screen.py`)
+A headless daemon that renders the dashboard and streams it to a Turing 3.5" / TURZX USB screen over serial.
 
-| ❌ _Waveshare [2.1inch](https://www.waveshare.com/wiki/2.1inch-USB-Monitor) / [2.8inch](https://www.waveshare.com/wiki/2.8inch-USB-Monitor) / [5inch](https://www.waveshare.com/wiki/5inch-USB-Monitor) / [7inch](https://www.waveshare.com/wiki/7inch-USB-Monitor) USB-Monitor_                                                                                                            | ❌ _[GUITION Smart screen 3.5"](https://aliexpress.com/item/1005006169962183.html)_                                                                                                                                                                                                          |
-|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="res/docs/waveshare-21inch-28inch.png"/>                                                                                                                                                                                                                                                                                                                                          | <img src="res/docs/guition.webp"/>                                                                                                                                                                                                                                                          |
-| Sold on [Waveshare shop](https://www.waveshare.com/2.8inch-usb-monitor.htm) or [Aliexpress](https://fr.aliexpress.com/item/1005006071685067.html). Managed by [proprietary Windows software "Waveshare PC Monitor"](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Vendor-apps#waveshare-pc-monitor---vendor-app). Cannot be supported by this project: needs a firmware. | Managed by [proprietary Windows software "GUITION Smart screen"](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Vendor-apps#guition---vendor-app). Cannot be supported by this project: [see here](https://github.com/mathoudebine/turing-smart-screen-python/issues/426). |
+```bat
+start_widget.bat         REM start the daemon  (pyw -3.13 claude_screen.py)
+stop_widget.bat          REM stop it (reads the PID file)
+```
 
-| ❌ _[(Fuldho?) 3.5" IPS Screen](https://aliexpress.com/item/1005005632018367.html)_                                                                                                                                                     |
-|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="res/docs/fuldho_3.5.jpg" width="40%" height="40%" />                                                                                                                                                                         |
-| Managed by [proprietary Windows software `SmartMonitor.exe`](https://smartdisplay.lanzouo.com/b04jvavkb). Cannot be supported by this project: [see here](https://github.com/mathoudebine/turing-smart-screen-python/discussions/298). |
+```bat
+python claude_screen.py --preview     REM render sample frames to ./preview_*.png (no hardware)
+python claude_screen.py --demo        REM cycle idle/working/attention on the panel
+```
 
-</details>
+## Setup
 
-### [> What is my smart screen model?](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Hardware-revisions)  
+Requires **Python 3.13** (pinned — see [Python 3.13 note](#notes)).
 
-**Please note all listed smart screens are different products** designed and produced by different companies, despite having a similar appearance. Their communication protocol is also different.  
-This project offers an abstraction layer to manage all of these products in a unified way, including some product-specific features like backplate RGB LEDs for available models!
+```bat
+pip install -r requirements.txt        REM widget core: pyserial, Pillow, numpy
+pip install -r requirements-app.txt    REM desktop app extras: PySide6, tzdata
+```
 
-If you haven't received your screen yet but want to start developing your theme now, you can use the [**"simulated LCD" mode!**](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Simulated-display)
+### Wire up the state hooks (so the buddy reacts)
+`install_hooks.py` merges the lifecycle hooks into `~/.claude/settings.json`:
 
-## How to start
+```bat
+python install_hooks.py --script "%CD%\set_state.py"
+python install_hooks.py --remove        REM to undo
+```
 
-### [> Follow instructions on the wiki to configure and start this project.](https://github.com/mathoudebine/turing-smart-screen-python/wiki)
+| Hook event | State | When |
+|---|---|---|
+| `UserPromptSubmit` | working | you send a prompt |
+| `PreToolUse` (matcher `AskUserQuestion`) | **attention** | Claude opens a question dialog and waits for you |
+| `PostToolUse` | working | a tool finished / your answer was received |
+| `Notification` | attention | permission prompts, idle "waiting for you", MCP elicitations |
+| `Stop` | idle | the turn ended |
 
-There are 2 possible uses of this project Python code:
-* **[as a System Monitor](#system-monitor)**, a standalone program working with themes to display your computer HW info and custom data in an elegant way.
-[Check if your hardware is supported.](https://github.com/mathoudebine/turing-smart-screen-python/wiki/System-monitor-:-hardware-support)
-* **[integrated in your project](#control-the-display-from-your-python-projects)**, to fully control the display from your own Python code.
+`set_state.py` is the lightweight hook entry point — it just writes `~/.claude/claude-screen-state.json`, which the daemon and the app both read. The `attention` alert **persists until you respond** (it doesn't auto-decay). Claude Code snapshots hooks at startup, so restart your session (or run `/hooks`) after installing.
 
-## System monitor
+### Auto-start at login (optional, Windows)
+```powershell
+powershell -ExecutionPolicy Bypass -File install_autostart.ps1     # registers a "ClaudeStatusBuddy" scheduled task
+powershell -ExecutionPolicy Bypass -File uninstall_autostart.ps1
+```
 
-This project is mainly a complete standalone program to use your screen as a system monitor, like the original vendor app.  
-Some themes are already included for a quick start!  
-### [> Configure and start system monitor](https://github.com/mathoudebine/turing-smart-screen-python/wiki/System-monitor-:-how-to-start)
-<img src="res/docs/config_wizard.png"/>  
+## How usage is measured
 
-* Fully functional multi-OS code base (operates out of the box, tested on Windows, Linux & MacOS).
-* Display configuration using GUI configuration wizard or `config.yaml` file: no Python code to edit.
-* Compatible with [multiple smart screen models (Turing, XuanFang...)](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Hardware-revisions). Backplate RGB LEDs are also supported for available models!
-* Support [multiple hardware sensors and metrics (CPU/GPU usage, temperatures, memory, disks, etc)](https://github.com/mathoudebine/turing-smart-screen-python/wiki/System-monitor-:-themes#stats-entry) with configurable refresh intervals.
-* Allow [creation of themes (see `res/themes`) with `theme.yaml` files using theme editor](https://github.com/mathoudebine/turing-smart-screen-python/wiki/System-monitor-:-themes) to be [shared with the community!](https://github.com/mathoudebine/turing-smart-screen-python/discussions/categories/themes)
-* Easy to expand: [custom Python data sources](https://github.com/mathoudebine/turing-smart-screen-python/wiki/System-monitor-:-themes#add-custom-stats-to-a-theme) can be written to pull specific information and display it on themes like any other sensor.
-* Auto-detect COM port based on the selected smart screen model.
-* Tray icon with Exit option, useful when the program is running in background.
+The gauges use Claude Code's own OAuth token (from `~/.claude/.credentials.json`) to call the usage endpoint, refreshing the token when it expires (and writing the rotated token back, so the CLI stays logged in). This is why the percentages match `/usage` exactly instead of drifting like a token-count estimate would.
 
-### [> List and preview of included themes](res/themes/themes.md)
-<img src="res/themes/3.5inchTheme2/preview.png" height="150" /> <img src="res/themes/Terminal/preview.png" height="150" /> <img src="res/themes/Cyberpunk-net/preview.png" height="150" /> <img src="res/themes/bash-dark-green-gpu/preview.png" height="150" /> <img src="res/themes/Landscape6Grid/preview.png" width="150" /> <img src="res/themes/LandscapeMagicBlue/preview.png" width="150" /> <img src="res/themes/LandscapeEarth/preview.png" width="150" /> ... [view full list](res/themes/themes.md)
-### [> Themes creation/edition (using theme editor)](https://github.com/mathoudebine/turing-smart-screen-python/wiki/System-monitor-:-themes)
-### [> Themes shared by the community](https://github.com/mathoudebine/turing-smart-screen-python/discussions/categories/themes)
-<img src="https://user-images.githubusercontent.com/79225820/203648707-6f043068-5c9d-454d-9c0a-3d9ea02ece77.jpg" height="150" /> <img src="https://user-images.githubusercontent.com/121983479/210663324-994c987a-6489-4482-8883-db74ef566014.jpg" height="150" />
-<img src="https://user-images.githubusercontent.com/120036534/208128675-897f60cd-5647-40b7-b074-b56b67e775dd.png" height="150" /> <img src="https://user-images.githubusercontent.com/65172896/217549510-149913ac-ef4e-4f61-8f5e-6d768483a02c.png" height="150" /> and more... Share yours!
+Diagnostic — print the raw endpoint response any time a gauge looks off:
+```bat
+python tools/check-claude-usage.py
+```
 
-## Control the display from your Python projects
+## Hardware / configuration
 
-If you don't want to use your screen for system monitoring, you can just use this project as a module from any Python code to do some simple operations on the display:
-- **Display custom picture**
-- **Display text**
-- **Display horizontal / radial progress bar**
-- **Screen rotation**
-- Clear the screen (blank)
-- Turn the screen on/off
-- Display soft reset
-- Set brightness
-- Set backplate RGB LEDs color (on supported hardware rev.) 
+Knobs live at the top of [`claude_screen.py`](claude_screen.py):
 
-This project will act as an abstraction library to handle specific protocols and capabilities of each supported smart screen models in a transparent way for the user.
-Check `simple-program.py` as an example.
+| Setting | Default | Notes |
+|---|---|---|
+| `COM_PORT` | `COM5` | your panel's serial port |
+| `REVISION` | `A` | Turing 3.5" / TURZX = rev A; `B` / `C` also supported |
+| `WIDTH, HEIGHT` | `480, 320` | dashboard is drawn in landscape, rotated to the panel's native portrait buffer |
+| `BRIGHTNESS` | `50` | rev A runs hot — keep ≤ 50% |
+| `WEEKLY_TZ_NAME` / `WEEKLY_RESET_*` | `Europe/Rome`, Tue 21:00 | weekly reset anchor (find yours in `/usage`); also editable in the app |
 
-### [> Control the display from your code](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Control-screen-from-your-own-code)
+## Notes
 
-## Troubleshooting
-If you have trouble running the program as described in the wiki, please check [open/closed issues](https://github.com/mathoudebine/turing-smart-screen-python/issues) & [the wiki Troubleshooting page](https://github.com/mathoudebine/turing-smart-screen-python/wiki/Troubleshooting)
+- **Python 3.13** is required: the panel driver and PySide6 packages are installed for 3.13 on this machine (3.14 has no wheels yet).
+- The desktop app and the daemon share one renderer (`render_frame` / `compute_usage` / `draw_buddy` in `claude_screen.py`), so they always look identical. Only one process should own the COM port at a time — the app kills a running daemon (via its PID file) before connecting.
 
-## They're talking about it!
+## Credits & license
 
-* [Hackaday - Cheap LCD Uses USB Serial](https://hackaday.com/2023/09/11/cheap-lcd-uses-usb-serial/)  
-
-
-* [CNX Software - Turing Smart Screen – A low-cost 3.5-inch USB Type-C information display](https://www.cnx-software.com/2022/04/29/turing-smart-screen-a-low-cost-3-5-inch-usb-type-c-information-display/)
-
-
-* [Phazer Tech - Turing Smart Screen Python ](https://phazertech.com/tutorials/turing-smart-screen.html)
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mathoudebine/turing-smart-screen-python&type=Date)](https://star-history.com/#mathoudebine/turing-smart-screen-python&Date)
+This project is a fork of [turing-smart-screen-python](https://github.com/mathoudebine/turing-smart-screen-python) and remains licensed under **GPLv3** (see [LICENSE](LICENSE), [AUTHORS](AUTHORS), [COPYRIGHT](COPYRIGHT)). All Turing / XuanFang / Kipye trademarks belong to their respective owners; this is unofficial, unaffiliated software.
