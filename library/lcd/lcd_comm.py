@@ -95,10 +95,9 @@ class LcdComm(ABC):
             if not self.com_port:
                 logger.error(
                     "Cannot find COM port automatically, please run Configuration again and select COM port manually")
-                try:
-                    sys.exit(0)
-                except:
-                    os._exit(0)
+                # Local change: raise instead of os._exit(0) so a GUI host (claude_app.py) can
+                # catch a missing/busy port and degrade gracefully instead of being force-killed.
+                raise IOError("Cannot find COM port automatically")
             else:
                 logger.debug(f"Auto detected COM port: {self.com_port}")
         else:
@@ -108,10 +107,8 @@ class LcdComm(ABC):
             self.lcd_serial = serial.Serial(self.com_port, 115200, timeout=1, rtscts=True)
         except Exception as e:
             logger.error(f"Cannot open COM port {self.com_port}: {e}")
-            try:
-                sys.exit(0)
-            except:
-                os._exit(0)
+            # Local change: raise instead of os._exit(0) (see note above) so the caller decides.
+            raise
 
     def closeSerial(self):
         if self.lcd_serial is not None:

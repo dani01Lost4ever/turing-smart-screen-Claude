@@ -462,7 +462,16 @@ class PanelController(QObject):
                     os.kill(pid, 15)
                 except OSError:
                     pass
-            time.sleep(0.6)                       # let the port release
+            # Wait for the process to actually die and release the USB serial handle. A force
+            # kill is async, so opening the port too soon races and init fails; ~2s is a safe
+            # margin on Windows. (init_lcd now degrades gracefully if it's still held anyway.)
+            for _ in range(20):
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                except OSError:
+                    break                         # process gone
+            time.sleep(0.4)                       # small extra margin for the handle to release
         try:
             cs.PID_FILE.unlink()
         except OSError:

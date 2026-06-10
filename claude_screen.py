@@ -933,7 +933,10 @@ def render_celebration_frame(t, usage, label, parts):
 
 # ------------------------------ DISPLAY -------------------------------
 def init_lcd():
-    """Create the LcdComm for your screen. Revision A = Turing 3.5 / UsbPCMonitor."""
+    """Create the LcdComm for your screen (Revision A = Turing 3.5 / UsbPCMonitor).
+    Returns None on any failure and NEVER crashes the caller — important when the GUI app
+    hosts the panel, since a busy COM port must degrade to "couldn't connect", not kill the
+    process. (The vendored driver's openSerial() is patched to raise instead of os._exit().)"""
     try:
         from library.lcd.lcd_comm import Orientation  # Orientation lives here, not in the rev module
         if REVISION == "A":
@@ -944,18 +947,18 @@ def init_lcd():
             from library.lcd.lcd_comm_rev_c import LcdCommRevC as Lcd  # Turing 2.1"/5"/8.8"
         # construct with the panel's NATIVE (portrait) size; SetOrientation rotates it
         lcd = Lcd(com_port=COM_PORT, display_width=NATIVE_W, display_height=NATIVE_H)
-    except Exception as e:
-        print("Could not load the display library.\n"
-              "Run this script from inside your turing-smart-screen folder\n"
-              "(so 'library/...' is importable), and check REVISION matches your screen.\n"
+        lcd.Reset()
+        lcd.InitializeComm()
+        lcd.SetBrightness(level=BRIGHTNESS)
+        # keep the device in its native portrait buffer; we rotate frames ourselves in push()
+        lcd.SetOrientation(orientation=Orientation.PORTRAIT)
+        lcd.Clear()
+    except (Exception, SystemExit) as e:    # SystemExit: driver also calls sys.exit() on serial errors
+        print("Could not initialize the display.\n"
+              "Check REVISION matches your screen and that the COM port is free "
+              "(another widget instance may still hold it).\n"
               f"Detail: {e}")
         return None
-    lcd.Reset()
-    lcd.InitializeComm()
-    lcd.SetBrightness(level=BRIGHTNESS)
-    # keep the device in its native portrait buffer; we rotate frames ourselves in push()
-    lcd.SetOrientation(orientation=Orientation.PORTRAIT)
-    lcd.Clear()
     return lcd
 
 
