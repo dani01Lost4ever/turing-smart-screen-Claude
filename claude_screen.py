@@ -80,6 +80,7 @@ COUNT_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens")
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 CRED_FILE = CLAUDE_DIR / ".credentials.json"     # Claude Code's OAuth tokens
+USAGE_CACHE_FILE = CLAUDE_DIR / "claude-screen-usage-cache.json"  # last good OAuth reading
 STATE_FILE = CLAUDE_DIR / "claude-screen-state.json"
 PID_FILE = CLAUDE_DIR / "claude-screen.pid"      # daemon PID; stop_widget.bat reads it
 
@@ -365,38 +366,88 @@ def _oauth_fetch_once():
     }
 
 
+def _oauth_save_cache(data):
+    """Persist the last good reading so a fresh start or an outage shows the last live
+    value instead of the far-off local estimate. Atomic write; failures are non-fatal."""
+    try:
+        USAGE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "session_pct": data["session_pct"],
+            "weekly_pct": data["weekly_pct"],
+            "session_resets_at": data["session_resets_at"].isoformat() if data["session_resets_at"] else None,
+            "weekly_resets_at": data["weekly_resets_at"].isoformat() if data["weekly_resets_at"] else None,
+            "fetched": data["fetched"],
+        }
+        tmp = USAGE_CACHE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(USAGE_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _oauth_load_cache():
+    """Last good reading from disk (same shape as _oauth_fetch_once), or None."""
+    try:
+        d = json.loads(USAGE_CACHE_FILE.read_text(encoding="utf-8"))
+        return {
+            "session_pct": float(d["session_pct"]),
+            "weekly_pct": float(d["weekly_pct"]),
+            "session_resets_at": _oauth_parse_reset(d.get("session_resets_at")),
+            "weekly_resets_at": _oauth_parse_reset(d.get("weekly_resets_at")),
+            "fetched": float(d.get("fetched", 0)),
+        }
+    except Exception:
+        return None
+
+
 def _oauth_poll_loop():
     global _oauth_data
     while True:
         try:
             _oauth_data = _oauth_fetch_once()
+            _oauth_save_cache(_oauth_data)            # survive restarts / outages
             delay = OAUTH_POLL_SEC
         except Exception:
-            # No creds / offline / refresh rejected: back off so we don't hammer the
-            # token endpoint, and let compute_usage fall back to local estimates.
+            # No creds / offline / refresh rejected: back off so we don't hammer the token
+            # endpoint. compute_usage keeps showing the cached reading (below) meanwhile.
             delay = OAUTH_BACKOFF_SEC
         time.sleep(delay)
 
 
 def _oauth_snapshot():
-    """Latest server-truth reading as compute_usage overrides, or None. Starts the
-    poller lazily so importing this module (tests, preview) never touches the network."""
-    global _oauth_started
+    """Latest server-truth reading as compute_usage overrides, or None. Starts the poller
+    lazily (seeding from the on-disk cache so a cold start shows the last live value, not the
+    far-off local estimate). A cached metric keeps showing until its window actually resets;
+    'exact' is True only while the reading is fresh, so a stale one still renders but is
+    marked '(est)' instead of silently masquerading as live."""
+    global _oauth_started, _oauth_data
     if not USE_OAUTH_USAGE:
         return None
     with _oauth_start_lock:
         if not _oauth_started:
             _oauth_started = True
+            _oauth_data = _oauth_load_cache()         # seed before the first network poll
             threading.Thread(target=_oauth_poll_loop, daemon=True).start()
     data = _oauth_data
-    if not data or time.time() - data["fetched"] > OAUTH_STALE_SEC:
+    if not data:
         return None
     now = datetime.now(timezone.utc)
-    out = {"session_pct": data["session_pct"], "weekly_pct": data["weekly_pct"], "exact": True}
-    if data["session_resets_at"]:
-        out["reset_in"] = max(data["session_resets_at"] - now, timedelta(0))
-    if data["weekly_resets_at"]:
-        out["weekly_reset_in"] = max(data["weekly_resets_at"] - now, timedelta(0))
+    fresh = (time.time() - data["fetched"]) <= OAUTH_STALE_SEC
+    out = {}
+    # Trust each metric until its window resets: usage only climbs within a window, so a
+    # cached value is a valid floor. Past the reset it's wrong, so we drop it and let the
+    # gauge fall back to the local estimate until the next live poll corrects it.
+    if data["session_resets_at"] is None or now < data["session_resets_at"]:
+        out["session_pct"] = data["session_pct"]
+        if data["session_resets_at"]:
+            out["reset_in"] = max(data["session_resets_at"] - now, timedelta(0))
+    if data["weekly_resets_at"] is None or now < data["weekly_resets_at"]:
+        out["weekly_pct"] = data["weekly_pct"]
+        if data["weekly_resets_at"]:
+            out["weekly_reset_in"] = max(data["weekly_resets_at"] - now, timedelta(0))
+    if not out:
+        return None
+    out["exact"] = fresh
     return out
 
 
