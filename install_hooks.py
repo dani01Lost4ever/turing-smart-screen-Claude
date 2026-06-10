@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-install_hooks.py - register the claude_screen.py state hooks with Claude Code.
+install_hooks.py - register the screen's state hooks with Claude Code.
 
-It merges three hooks into your Claude Code settings.json (default: ~/.claude/settings.json):
-    UserPromptSubmit -> --set-state working     (mascot speeds up)
-    Notification     -> --set-state attention   (flashing alert; only real attention prompts)
-    Stop             -> --set-state idle         (calm)
+It merges these hooks into your Claude Code settings.json (default: ~/.claude/settings.json):
+    UserPromptSubmit -> working     (you sent a prompt; mascot speeds up)
+    PreToolUse[AskUserQuestion] -> attention   (Claude opened a question dialog and is WAITING
+                                                for you -> the "needs you" alert; this is the
+                                                event that AskUserQuestion does NOT raise as a
+                                                Notification, so without it the screen stayed calm)
+    PostToolUse      -> working     (a tool finished -> Claude is active again; also fires when
+                                     you answer a question, which clears the attention alert. Firing
+                                     on every tool keeps the buddy "working" through a long task.)
+    Notification     -> attention   (catch-all: permission prompts, idle "waiting for you", MCP
+                                     elicitation dialogs)
+    Stop             -> idle         (turn ended -> calm)
 
-That single user-level file is read by Claude Code whether you launch it from the terminal
-OR from inside the desktop app, so both are covered at once.
-
-NOTE on "Claude Desktop": the consumer Claude chat desktop app has no lifecycle-hook system
-(it only supports MCP connectors via claude_desktop_config.json), so there is nothing to
-register there. This script intentionally does not touch it.
+The hook command points at set_state.py (tiny, no PIL import) so the per-tool-call PostToolUse
+hook stays cheap. That single user-level settings file is read by Claude Code whether you launch
+from the terminal OR the desktop app / IDE, so all are covered at once.
 
 USAGE
-    python install_hooks.py --script /abs/path/to/claude_screen.py
+    python install_hooks.py --script /abs/path/to/set_state.py
     python install_hooks.py --script ... --dry-run      # show changes, write nothing
     python install_hooks.py --remove                    # remove the hooks we added
     optional: --settings /abs/path/settings.json   --python /abs/path/to/pythonw.exe
@@ -28,10 +33,14 @@ from datetime import datetime
 # event -> (state, matcher).  matcher "" means "fire on every occurrence".
 HOOKS = {
     "UserPromptSubmit": ("working",   ""),
-    "Notification":     ("attention", "permission_prompt|idle_prompt|elicitation_dialog"),
+    "PreToolUse":       ("attention", "AskUserQuestion"),
+    "PostToolUse":      ("working",   ""),
+    "Notification":     ("attention", ""),
     "Stop":             ("idle",      ""),
 }
-TAG = "claude_screen.py"  # used to recognise (and later remove) our own hooks
+# Substrings that mark a hook as ours, so we can dedupe and cleanly remove/upgrade. Includes the
+# legacy "claude_screen.py --set-state" form so re-running this migrates old installs.
+TAGS = ("set_state.py", "claude_screen.py --set-state")
 
 
 def default_python():
@@ -43,7 +52,17 @@ def default_python():
 
 
 def build_command(python_exe, script_path, state):
-    return f'{python_exe} "{script_path}" --set-state {state}'
+    return f'{python_exe} "{script_path}" {state}'
+
+
+def _is_ours(cmd):
+    return any(tag in cmd for tag in TAGS)
+
+
+def _targets_state(cmd, state):
+    """True if this (ours) command sets the given state, in either the new positional form
+    ('... set_state.py attention') or the legacy form ('... --set-state attention')."""
+    return cmd.strip().split()[-1:] == [state] or f"--set-state {state}" in cmd
 
 
 def load_settings(path):
@@ -60,12 +79,15 @@ def has_our_hook(groups, state):
     for g in groups:
         for h in g.get("hooks", []):
             cmd = h.get("command", "")
-            if TAG in cmd and f"--set-state {state}" in cmd:
+            if _is_ours(cmd) and _targets_state(cmd, state):
                 return True
     return False
 
 
 def install(settings, python_exe, script_path):
+    # Drop any of our previous hooks first so re-running upgrades a stale install (e.g. the
+    # old claude_screen.py form, or a changed matcher) instead of leaving duplicates behind.
+    remove(settings)
     hooks = settings.setdefault("hooks", {})
     added = []
     for event, (state, matcher) in HOOKS.items():
@@ -77,7 +99,7 @@ def install(settings, python_exe, script_path):
         if matcher:
             group["matcher"] = matcher
         groups.append(group)
-        added.append(f"{event} -> {state}")
+        added.append(f"{event}{f'[{matcher}]' if matcher else ''} -> {state}")
     return added
 
 
@@ -87,7 +109,7 @@ def remove(settings):
     for event in list(hooks.keys()):
         new_groups = []
         for g in hooks[event]:
-            kept = [h for h in g.get("hooks", []) if TAG not in h.get("command", "")]
+            kept = [h for h in g.get("hooks", []) if not _is_ours(h.get("command", ""))]
             if len(kept) != len(g.get("hooks", [])):
                 removed.append(event)
             if kept:

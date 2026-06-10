@@ -8,12 +8,15 @@ MODES
   python claude_screen.py --set-state STATE      write the state file (called by Claude Code hooks)
                                                  STATE = attention | working | idle
 
-DATA SOURCES (all local, no API keys, no network)
-  * Usage:  ~/.claude/projects/**/*.jsonl   (token usage Claude Code writes locally)
+DATA SOURCES
+  * Usage:  https://api.anthropic.com/api/oauth/usage  (the exact numbers /usage shows),
+            authenticated with the OAuth token Claude Code stores in ~/.claude/.credentials.json.
+            Falls back to estimating from ~/.claude/projects/**/*.jsonl when unavailable.
   * State:  ~/.claude/claude-screen-state.json   (hooks write it, the daemon reads it)
 """
 
 import os, sys, json, glob, time, math, argparse, threading
+import urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -35,12 +38,26 @@ STATS_REFRESH_SEC = 300    # recompute the heavy footer stats this often (off th
 CLAUDE_STATUS_URL = "https://status.claude.com/api/v2/summary.json"
 CLAUDE_STATUS_REFRESH_SEC = 60   # poll the Anthropic status page this often
 
-# --- Session gauge: auto-calibrated via claude-monitor (P90 dynamic limit) if available ---
+# --- Exact usage via Claude Code's OAuth credentials (the same numbers /usage shows) ---
+# A background thread polls Anthropic's usage endpoint every OAUTH_POLL_SEC with the token
+# from ~/.claude/.credentials.json, refreshing it when expired (and persisting the rotated
+# token back, so the CLI keeps working). Both gauges then show server-truth percentages.
+USE_OAUTH_USAGE = True
+OAUTH_POLL_SEC = 60                   # ~1/min, like watching /usage
+OAUTH_STALE_SEC = 600                 # use the last good reading for up to 10 min of failures
+OAUTH_BACKOFF_SEC = 900               # wait this long after a refresh failure / missing creds
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"   # Claude Code's public client id
+OAUTH_UA = "claude-screen-widget/1.0"
+
+# --- Session gauge fallback #1: claude-monitor (P90 dynamic limit) if available ---
 USE_CLAUDE_MONITOR = True             # pip install claude-monitor ; falls back to budget below
 PLAN = "max20"                        # pro | max5 | max20 | custom  (your Claude plan)
 
-# Fallback budgets (used only if claude-monitor isn't installed). The weekly gauge always
-# uses the local parser below, since claude-monitor doesn't model the weekly cap.
+# Fallback budgets (used only if claude-monitor isn't installed). The weekly gauge
+# uses the local parser below when OAuth data is unavailable, since claude-monitor
+# doesn't model the weekly cap.
 SESSION_WINDOW_HRS = 5
 # Re-calibrate when the screen % drifts from Claude Code's /usage %:
 #   new_budget = old_budget * (screen% / real%)
@@ -62,11 +79,17 @@ COUNT_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens")
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+CRED_FILE = CLAUDE_DIR / ".credentials.json"     # Claude Code's OAuth tokens
 STATE_FILE = CLAUDE_DIR / "claude-screen-state.json"
 PID_FILE = CLAUDE_DIR / "claude-screen.pid"      # daemon PID; stop_widget.bat reads it
 
-ATTENTION_HOLD = 60        # seconds an "attention" state stays hot before auto-clearing
-WORKING_HOLD = 45
+# "attention" persists until an explicit working/idle event clears it ("stay until I respond"):
+# every way out of a question writes a fresh state (answer -> PostToolUse=working, new prompt ->
+# UserPromptSubmit=working, turn end -> Stop=idle), so it never gets stuck on for no reason.
+ATTENTION_HOLD = None       # None = never auto-decay ; set a number of seconds to time it out
+# With per-tool-call PostToolUse pings (see install_hooks.py), "working" is refreshed throughout
+# a task; this hold is just a backstop for a single long-running tool call (e.g. a slow build).
+WORKING_HOLD = 120
 
 # palette
 BG    = (13, 13, 15)
@@ -123,8 +146,8 @@ def read_state():
         state, age = d.get("state", "idle"), time.time() - d.get("ts", 0)
     except Exception:
         return "idle"
-    if state == "attention" and age > ATTENTION_HOLD:
-        return "idle"
+    if state == "attention":
+        return "idle" if (ATTENTION_HOLD is not None and age > ATTENTION_HOLD) else "attention"
     if state == "working" and age > WORKING_HOLD:
         return "idle"
     return state
@@ -260,9 +283,132 @@ def _session_via_monitor():
         return None
 
 
+# ---- exact usage from Anthropic's OAuth endpoint (what /usage shows) ----
+_oauth_data = None            # last good reading; replaced atomically by the poller thread
+_oauth_started = False
+_oauth_start_lock = threading.Lock()
+
+
+def _oauth_load_creds():
+    return json.loads(CRED_FILE.read_text(encoding="utf-8"))
+
+
+def _oauth_save_creds(creds):
+    """Atomic write so a crash can't leave the CLI with a truncated credentials file."""
+    tmp = CRED_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(creds), encoding="utf-8")
+    tmp.replace(CRED_FILE)
+
+
+def _oauth_refresh(creds):
+    """Exchange the refresh token for a new access token and persist it (Claude Code
+    rotates refresh tokens, so the new one MUST be written back or the CLI logs out)."""
+    oauth = creds["claudeAiOauth"]
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": oauth["refreshToken"],
+        "client_id": OAUTH_CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Accept": "application/json", "User-Agent": OAUTH_UA,
+    })
+    with urllib.request.urlopen(req, timeout=20) as r:
+        tok = json.loads(r.read())
+    oauth["accessToken"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        oauth["refreshToken"] = tok["refresh_token"]
+    oauth["expiresAt"] = int(time.time() * 1000) + int(tok.get("expires_in", 28800)) * 1000
+    _oauth_save_creds(creds)
+    return oauth["accessToken"]
+
+
+def _oauth_get_usage(token):
+    req = urllib.request.Request(OAUTH_USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json", "User-Agent": OAUTH_UA,
+    })
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def _oauth_parse_reset(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _oauth_fetch_once():
+    """One poll: ensure a valid token (refreshing if expired), hit the usage endpoint.
+    Returns the parsed reading, or raises."""
+    creds = _oauth_load_creds()
+    oauth = creds["claudeAiOauth"]
+    token = oauth["accessToken"]
+    if oauth.get("expiresAt", 0) <= time.time() * 1000 + 60_000:
+        token = _oauth_refresh(creds)
+    try:
+        raw = _oauth_get_usage(token)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        raw = _oauth_get_usage(_oauth_refresh(creds))   # stale token: refresh once and retry
+    five, week = raw.get("five_hour") or {}, raw.get("seven_day") or {}
+    return {
+        "session_pct": min(float(five.get("utilization") or 0) / 100.0, 1.0),
+        "session_resets_at": _oauth_parse_reset(five.get("resets_at")),
+        "weekly_pct": min(float(week.get("utilization") or 0) / 100.0, 1.0),
+        "weekly_resets_at": _oauth_parse_reset(week.get("resets_at")),
+        "fetched": time.time(),
+    }
+
+
+def _oauth_poll_loop():
+    global _oauth_data
+    while True:
+        try:
+            _oauth_data = _oauth_fetch_once()
+            delay = OAUTH_POLL_SEC
+        except Exception:
+            # No creds / offline / refresh rejected: back off so we don't hammer the
+            # token endpoint, and let compute_usage fall back to local estimates.
+            delay = OAUTH_BACKOFF_SEC
+        time.sleep(delay)
+
+
+def _oauth_snapshot():
+    """Latest server-truth reading as compute_usage overrides, or None. Starts the
+    poller lazily so importing this module (tests, preview) never touches the network."""
+    global _oauth_started
+    if not USE_OAUTH_USAGE:
+        return None
+    with _oauth_start_lock:
+        if not _oauth_started:
+            _oauth_started = True
+            threading.Thread(target=_oauth_poll_loop, daemon=True).start()
+    data = _oauth_data
+    if not data or time.time() - data["fetched"] > OAUTH_STALE_SEC:
+        return None
+    now = datetime.now(timezone.utc)
+    out = {"session_pct": data["session_pct"], "weekly_pct": data["weekly_pct"], "exact": True}
+    if data["session_resets_at"]:
+        out["reset_in"] = max(data["session_resets_at"] - now, timedelta(0))
+    if data["weekly_resets_at"]:
+        out["weekly_reset_in"] = max(data["weekly_resets_at"] - now, timedelta(0))
+    return out
+
+
 def compute_usage():
-    """Weekly always from the local parser; session from claude-monitor when available."""
+    """Both gauges from Anthropic's usage endpoint when available (exact, matches /usage);
+    otherwise weekly from the local parser and session from claude-monitor / the budget."""
     usage = _compute_usage_local()
+    usage["exact"] = False
+    snap = _oauth_snapshot()
+    if snap:
+        usage.update(snap)               # exact session_pct / weekly_pct / reset countdowns
+        return usage
     if USE_CLAUDE_MONITOR:
         session = _session_via_monitor()
         if session:
@@ -668,10 +814,11 @@ def render_frame(t, usage, state):
     draw_claude_status(d, F)                                       # status.claude.com chip (top-right)
 
     gx, gw = 176, WIDTH - 176 - 28                                 # gauges (right)
+    est = "" if usage.get("exact") else " (est)"                   # flag fallback estimates
     draw_gauge(d, gx, 86, gw, "5h session", usage["session_pct"],
-               f"{usage['session_tokens']:,} tok  -  resets {fmt_dur(usage['reset_in'])}", F)
+               f"{usage['session_tokens']:,} tok  -  resets {fmt_dur(usage['reset_in'])}{est}", F)
     draw_gauge(d, gx, 160, gw, "weekly", usage["weekly_pct"],
-               f"{usage['weekly_tokens']:,} tok  -  resets {fmt_dur(usage['weekly_reset_in'])}", F)
+               f"{usage['weekly_tokens']:,} tok  -  resets {fmt_dur(usage['weekly_reset_in'])}{est}", F)
 
     if _STATS and state != "attention":                            # dashboard footer (skip in alert)
         draw_stats(d, _STATS, F)
@@ -815,6 +962,7 @@ def run_daemon():
     last_usage = t0
     last_state = None
     prev_s, prev_w = usage["session_pct"], usage["weekly_pct"]
+    prev_exact = usage["exact"]
     send_full(lcd, render_frame(0.0, usage, read_state()))   # paint everything once
     try:
         while True:
@@ -831,11 +979,15 @@ def run_daemon():
                 last_usage = now
                 need_full = True
                 label = None                                  # detect a limit reset (sharp drop)
-                if prev_s >= RESET_MIN and usage["session_pct"] < prev_s - RESET_DROP:
-                    label = "5H RESET!"
-                elif prev_w >= RESET_MIN and usage["weekly_pct"] < prev_w - RESET_DROP:
-                    label = "WEEKLY RESET!"
+                # ...but not when the data source just flipped between exact (OAuth) and
+                # estimated (local): the level jump there isn't a real reset.
+                if usage["exact"] == prev_exact:
+                    if prev_s >= RESET_MIN and usage["session_pct"] < prev_s - RESET_DROP:
+                        label = "5H RESET!"
+                    elif prev_w >= RESET_MIN and usage["weekly_pct"] < prev_w - RESET_DROP:
+                        label = "WEEKLY RESET!"
                 prev_s, prev_w = usage["session_pct"], usage["weekly_pct"]
+                prev_exact = usage["exact"]
                 if label:
                     celebrate(lcd, usage, label)
                     last_state = None
@@ -858,7 +1010,7 @@ def run_preview():
     mock = {"session_tokens": 5_021_440, "session_pct": 0.70,
             "weekly_tokens": 74_400_000, "weekly_pct": 0.37,
             "reset_in": timedelta(hours=2, minutes=14),
-            "weekly_reset_in": timedelta(days=3, hours=5)}
+            "weekly_reset_in": timedelta(days=3, hours=5), "exact": True}
     _STATS = compute_stats()                              # real footer stats for the mockup
     for state in ("idle", "working", "attention"):
         render_frame(0.4, mock, state).save(f"preview_{state}.png")
