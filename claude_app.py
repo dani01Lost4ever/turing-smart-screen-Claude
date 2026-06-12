@@ -126,6 +126,7 @@ class DashboardPreview(QLabel):
         self._last_usage = time.monotonic()
         self._override = None
         self._last_state = None
+        self._last_page = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)                       # ~30 fps
@@ -149,12 +150,14 @@ class DashboardPreview(QLabel):
             self._last_usage = now
             usage_refreshed = True
         state = self.current_state()
-        img = cs.render_frame(now - self._t0, self._usage, state)
+        page = cs.idle_page() if state == "idle" else None      # idle cycles stat pages
+        img = cs.render_screen(now - self._t0, self._usage, state)
         self.setPixmap(pil_to_qpixmap(img))
-        # Panel needs a full redraw on state changes or after a usage refresh
-        # (gauges moved); otherwise the buddy tile is enough.
-        need_full = usage_refreshed or state != self._last_state
+        # Panel needs a full redraw on state changes, after a usage refresh (gauges moved), or
+        # when the idle stat page flips; otherwise the buddy tile is enough.
+        need_full = usage_refreshed or state != self._last_state or page != self._last_page
         self._last_state = state
+        self._last_page = page
         self.frameReady.emit(img, state, need_full)
 
 
@@ -533,15 +536,39 @@ class PanelController(QObject):
                 if need_full or state != last_state:
                     cs.send_full(self.lcd, img)
                     last_state = state
-                else:
-                    lx, ly, tw, th = cs.BUDDY_TILE
+                elif state != "idle":             # animate the buddy (working/attention) only;
+                    lx, ly, tw, th = cs.BUDDY_TILE   # idle stat pages are static, nothing to stream
                     cs.send_tile(self.lcd, img.crop((lx, ly, lx + tw, ly + th)),
                                   lx, ly, tw, th)
             except Exception:
                 pass                              # transient serial error; keep going
 
 
+SERVICE_TASK = "ClaudeStatusBuddy"      # the Windows scheduled task that runs the daemon
+
+
+def _service_task_exists():
+    if sys.platform != "win32":
+        return False
+    try:
+        return subprocess.run(["schtasks", "/Query", "/TN", SERVICE_TASK],
+                              capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def _launch_daemon():
+    """Start a fresh detached background daemon with the same interpreter as the app."""
+    script = Path(cs.__file__).resolve()
+    flags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+    subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent),
+                     creationflags=flags, close_fds=True)
+
+
 class MainWindow(QMainWindow):
+    refreshDone = Signal(str)            # live-refresh worker -> UI (carries the result string)
+    serviceRestarted = Signal(str)       # restart-service worker -> UI (carries the result string)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Claude Status Buddy")
@@ -589,10 +616,23 @@ class MainWindow(QMainWindow):
         self._act_redo.setEnabled(False)
         tb.addAction(self._act_redo)
         tb.addSeparator()
+        self._act_refresh = QAction(style.standardIcon(QStyle.SP_BrowserReload), "Refresh", self)
+        self._act_refresh.setShortcut(QKeySequence.Refresh)                  # F5
+        self._act_refresh.setToolTip("Fetch live usage from the endpoint now")
+        self._act_refresh.triggered.connect(self._refresh_live)
+        tb.addAction(self._act_refresh)
+        self.refreshDone.connect(self._on_refresh_done)
+        tb.addSeparator()
         self._panel_action = QAction("Connect to panel", self, checkable=True)
         self._panel_action.toggled.connect(self._toggle_panel)
         tb.addAction(self._panel_action)
         self.panel.connectionChanged.connect(self._on_panel_changed)
+        self._act_restart = QAction("Restart service", self)
+        self._act_restart.setToolTip("Cleanly restart the background panel daemon "
+                                     "(the ClaudeStatusBuddy service) so it picks up updates")
+        self._act_restart.triggered.connect(self._restart_service)
+        tb.addAction(self._act_restart)
+        self.serviceRestarted.connect(self._on_service_restarted)
         # Preview's frames feed the panel controller (it drops if not connected)
         self.preview.frameReady.connect(self.panel.on_frame_ready)
 
@@ -663,6 +703,79 @@ class MainWindow(QMainWindow):
     def _on_panel_changed(self, connected, msg):
         self.statusBar().showMessage(msg, 5000)
         self._panel_action.setText("Disconnect panel" if connected else "Connect to panel")
+
+    # ---- live usage refresh (Refresh button / F5) -----------------------------------
+    def _refresh_live(self):
+        """Force an immediate live fetch off the UI thread (it blocks on the network)."""
+        self._act_refresh.setEnabled(False)
+        self.statusBar().showMessage("Refreshing live usage…")
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+
+    def _refresh_worker(self):
+        self.refreshDone.emit(cs.oauth_force_refresh())   # queued connection -> _on_refresh_done
+
+    def _on_refresh_done(self, result):
+        self._act_refresh.setEnabled(True)
+        self.preview.force_usage_refresh()                # recompute the gauges on the next tick
+        if result == "live":
+            self.statusBar().showMessage("Live usage refreshed ✓", 4000)
+        else:
+            self.statusBar().showMessage(f"Couldn't refresh ({result}) — showing cached/estimate", 6000)
+
+    # ---- restart the background daemon ("the service") ------------------------------
+    def _restart_service(self):
+        """Cleanly restart the background daemon so it picks up code/setting changes.
+        Releases the panel first (if the app holds it) so the daemon can re-open COM5."""
+        self._act_restart.setEnabled(False)
+        if self.panel.connected:                       # hand COM5 back before the daemon grabs it
+            self._panel_action.setChecked(False)       # -> _toggle_panel(False) -> clean disconnect
+        self.statusBar().showMessage("Restarting background service…")
+        threading.Thread(target=self._restart_worker, daemon=True).start()
+
+    def _stop_daemon_cleanly(self, timeout=4.0):
+        """Ask a running daemon to shut down cleanly (Clear+ScreenOff via the stop-request file),
+        waiting for it to exit. Force-kill only as a last resort. No-op if none is running."""
+        try:
+            pid = int(cs.PID_FILE.read_text().strip())
+        except Exception:
+            return
+        try:
+            cs.STOP_FILE.write_text("stop")
+        except Exception:
+            pass
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return                                 # process gone — clean exit
+            time.sleep(0.15)
+        if sys.platform == "win32":                    # didn't stop in time -> last resort
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+
+    def _restart_worker(self):
+        try:
+            self._stop_daemon_cleanly()
+            time.sleep(0.4)                            # let the port release
+            if _service_task_exists():                 # restart via the scheduled task ("the service")
+                subprocess.run(["schtasks", "/End", "/TN", SERVICE_TASK], capture_output=True)
+                time.sleep(0.4)
+                r = subprocess.run(["schtasks", "/Run", "/TN", SERVICE_TASK],
+                                   capture_output=True, text=True)
+                res = "ok" if r.returncode == 0 else f"schtasks: {(r.stderr or r.stdout).strip()[:80]}"
+            else:                                      # no task installed -> just relaunch detached
+                _launch_daemon()
+                res = "ok"
+        except Exception as e:
+            res = f"{type(e).__name__}: {e}"
+        self.serviceRestarted.emit(res)
+
+    def _on_service_restarted(self, res):
+        self._act_restart.setEnabled(True)
+        if res == "ok":
+            self.statusBar().showMessage("Background service restarted — panel returns in ~10s", 7000)
+        else:
+            self.statusBar().showMessage(f"Service restart failed: {res}", 9000)
 
     def _theme_open(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open theme", str(cs.CLAUDE_DIR),

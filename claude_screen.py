@@ -42,10 +42,14 @@ CLAUDE_STATUS_REFRESH_SEC = 60   # poll the Anthropic status page this often
 # A background thread polls Anthropic's usage endpoint every OAUTH_POLL_SEC with the token
 # from ~/.claude/.credentials.json, refreshing it when expired (and persisting the rotated
 # token back, so the CLI keeps working). Both gauges then show server-truth percentages.
+# Polling is gentle on purpose: the endpoint rate-limits (HTTP 429), and the app + daemon may
+# BOTH run a poller, so each loop first adopts a recent shared-cache reading instead of
+# re-fetching (cross-process dedupe). Usage moves slowly, so the cache covers the gaps.
 USE_OAUTH_USAGE = True
-OAUTH_POLL_SEC = 60                   # ~1/min, like watching /usage
-OAUTH_STALE_SEC = 600                 # use the last good reading for up to 10 min of failures
-OAUTH_BACKOFF_SEC = 900               # wait this long after a refresh failure / missing creds
+OAUTH_POLL_SEC = 300                  # 5 min — gentle; the cache + manual Refresh cover the gaps
+OAUTH_STALE_SEC = 600                 # older than this (a couple missed polls) renders as "cached"
+OAUTH_BACKOFF_SEC = 600               # wait this long after a generic fetch/refresh error
+OAUTH_RATELIMIT_BACKOFF_SEC = 1800    # back off harder after HTTP 429 (rate limited)
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"   # Claude Code's public client id
@@ -83,6 +87,7 @@ CRED_FILE = CLAUDE_DIR / ".credentials.json"     # Claude Code's OAuth tokens
 USAGE_CACHE_FILE = CLAUDE_DIR / "claude-screen-usage-cache.json"  # last good OAuth reading
 STATE_FILE = CLAUDE_DIR / "claude-screen-state.json"
 PID_FILE = CLAUDE_DIR / "claude-screen.pid"      # daemon PID; stop_widget.bat reads it
+STOP_FILE = CLAUDE_DIR / "claude-screen-stop.req"  # touch -> daemon shuts down cleanly (app Restart)
 
 # "attention" persists until an explicit working/idle event clears it ("stay until I respond"):
 # every way out of a question writes a fresh state (answer -> PostToolUse=working, new prompt ->
@@ -91,6 +96,11 @@ ATTENTION_HOLD = None       # None = never auto-decay ; set a number of seconds 
 # With per-tool-call PostToolUse pings (see install_hooks.py), "working" is refreshed throughout
 # a task; this hold is just a backstop for a single long-running tool call (e.g. a slow build).
 WORKING_HOLD = 120
+# Robust "working" detection that does NOT depend on hooks firing: if any Claude Code transcript
+# (~/.claude/projects/**/*.jsonl) was written within this many seconds, Claude is actively working.
+# This is what fixes "the screen says idle while Claude is clearly busy" — hooks can be stale
+# (snapshotted at session start) or silent between tool calls, but the transcript is always fresh.
+WORKING_ACTIVITY_SEC = 60
 
 # palette
 BG    = (13, 13, 15)
@@ -140,18 +150,48 @@ def write_state(state):
     STATE_FILE.write_text(json.dumps({"state": state, "ts": time.time()}))
 
 
+_activity_cache = {"ts": 0.0, "active": False}
+_ACTIVITY_THROTTLE = 2.0           # recompute transcript-activity at most this often
+
+
+def _recent_transcript_activity():
+    """True if any ~/.claude/projects/**/*.jsonl was written within WORKING_ACTIVITY_SEC.
+    Cheap (mtime only, no parsing) and throttled, so read_state stays light at 30fps."""
+    now = time.time()
+    if now - _activity_cache["ts"] < _ACTIVITY_THROTTLE:
+        return _activity_cache["active"]
+    newest = 0.0
+    try:
+        for fp in glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True):
+            try:
+                m = os.path.getmtime(fp)
+            except OSError:
+                continue
+            if m > newest:
+                newest = m
+    except Exception:
+        pass
+    _activity_cache["ts"] = now
+    _activity_cache["active"] = bool(newest) and (now - newest) < WORKING_ACTIVITY_SEC
+    return _activity_cache["active"]
+
+
 def read_state():
-    """Return the effective state, applying hold timeouts so it decays back to idle."""
+    """Effective state. 'attention' (sticky, set by the hooks) wins. Otherwise 'working' if the
+    hooks said so recently OR a transcript was just written — the transcript check is what keeps
+    the buddy 'working' even when the hooks are stale or silent between tool calls. Else 'idle'."""
     try:
         d = json.loads(STATE_FILE.read_text())
         state, age = d.get("state", "idle"), time.time() - d.get("ts", 0)
     except Exception:
-        return "idle"
+        state, age = "idle", 1e9
     if state == "attention":
         return "idle" if (ATTENTION_HOLD is not None and age > ATTENTION_HOLD) else "attention"
-    if state == "working" and age > WORKING_HOLD:
-        return "idle"
-    return state
+    if state == "working" and age <= WORKING_HOLD:
+        return "working"
+    if _recent_transcript_activity():
+        return "working"
+    return "idle"
 
 
 # ------------------------------- USAGE --------------------------------
@@ -403,15 +443,50 @@ def _oauth_load_cache():
 def _oauth_poll_loop():
     global _oauth_data
     while True:
+        delay = OAUTH_POLL_SEC
         try:
-            _oauth_data = _oauth_fetch_once()
-            _oauth_save_cache(_oauth_data)            # survive restarts / outages
-            delay = OAUTH_POLL_SEC
+            # Cross-process dedupe: the app and the daemon can both run a poller. If the shared
+            # cache was refreshed (by the other one) within the interval, adopt it instead of
+            # hitting the endpoint again — keeps the combined request rate to ~1 per interval.
+            cached = _oauth_load_cache()
+            if cached and 0 <= (time.time() - cached["fetched"]) < OAUTH_POLL_SEC:
+                _oauth_data = cached
+                delay = OAUTH_POLL_SEC - (time.time() - cached["fetched"]) + 5
+            else:
+                _oauth_data = _oauth_fetch_once()
+                _oauth_save_cache(_oauth_data)        # survive restarts / outages
+        except urllib.error.HTTPError as e:
+            # 429 = rate limited: back off hard (honor Retry-After if given). The cache keeps
+            # the last good value showing meanwhile, marked "cached" once it ages past STALE.
+            if e.code == 429:
+                ra = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    delay = max(int(ra), OAUTH_RATELIMIT_BACKOFF_SEC)
+                except (TypeError, ValueError):
+                    delay = OAUTH_RATELIMIT_BACKOFF_SEC
+            else:
+                delay = OAUTH_BACKOFF_SEC
         except Exception:
-            # No creds / offline / refresh rejected: back off so we don't hammer the token
-            # endpoint. compute_usage keeps showing the cached reading (below) meanwhile.
+            # No creds / offline / refresh rejected: back off, keep showing the cached reading.
             delay = OAUTH_BACKOFF_SEC
-        time.sleep(delay)
+        time.sleep(max(delay, 5))
+
+
+def oauth_force_refresh():
+    """Force an immediate live fetch, bypassing the dedupe/interval (the app's Refresh button).
+    Runs on a worker thread (it blocks on the network). Returns 'live' on success, or a short
+    error string (e.g. 'rate limited') so the caller can surface it."""
+    global _oauth_data
+    if not USE_OAUTH_USAGE:
+        return "disabled"
+    try:
+        _oauth_data = _oauth_fetch_once()
+        _oauth_save_cache(_oauth_data)
+        return "live"
+    except urllib.error.HTTPError as e:
+        return "rate limited" if e.code == 429 else f"HTTP {e.code}"
+    except Exception as e:
+        return f"{type(e).__name__}"
 
 
 def _oauth_snapshot():
@@ -456,9 +531,11 @@ def compute_usage():
     otherwise weekly from the local parser and session from claude-monitor / the budget."""
     usage = _compute_usage_local()
     usage["exact"] = False
+    usage["source"] = "estimate"         # live = fresh endpoint ; cached = last good ; estimate = local
     snap = _oauth_snapshot()
     if snap:
         usage.update(snap)               # exact session_pct / weekly_pct / reset countdowns
+        usage["source"] = "live" if snap.get("exact") else "cached"
         return usage
     if USE_CLAUDE_MONITOR:
         session = _session_via_monitor()
@@ -493,6 +570,7 @@ def compute_stats(window_days=STATS_WINDOW_DAYS):
     cut = now - timedelta(days=window_days)
     cut_ts = cut.timestamp()
     seen, models = {}, {}                    # msg id -> (ts, tokens) ; msg id -> model
+    files_seen = set()                       # distinct transcripts with in-window activity (~sessions)
     if PROJECTS_DIR.exists():
         for fp in glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True):
             try:
@@ -521,19 +599,23 @@ def compute_stats(window_days=STATS_WINDOW_DAYS):
                         if mid not in seen or toks > seen[mid][1]:
                             seen[mid] = (ts, toks)
                             models[mid] = msg.get("model")
+                        files_seen.add(fp)
             except Exception:
                 continue
 
     day_tok = {}                             # local date -> tokens
     hour_msgs = [0] * 24                      # local hour -> message count
-    model_count = {}
+    model_count = {}                         # model label -> message count
+    model_tok = {}                           # model label -> tokens (for the Models screen)
     for mid, (ts, toks) in seen.items():
         lt = ts.astimezone(tz)
         day_tok[lt.date()] = day_tok.get(lt.date(), 0) + toks
         hour_msgs[lt.hour] += 1
         m = models.get(mid)
         if m:
-            model_count[m] = model_count.get(m, 0) + 1
+            lbl = _model_label(m)
+            model_count[lbl] = model_count.get(lbl, 0) + 1
+            model_tok[lbl] = model_tok.get(lbl, 0) + toks
 
     messages = len(seen)
     dayset = set(day_tok)
@@ -556,13 +638,15 @@ def compute_stats(window_days=STATS_WINDOW_DAYS):
     heat = [day_tok.get(today - timedelta(days=window_days - 1 - i), 0) for i in range(window_days)]
 
     return {
+        "sessions": len(files_seen),
         "messages": messages,
         "total_tokens": sum(t for _, t in seen.values()),
         "active_days": len(dayset),
         "current_streak": cur,
         "longest_streak": longest,
         "peak_hour": max(range(24), key=lambda h: hour_msgs[h]) if messages else 0,
-        "fav_model": _model_label(max(model_count, key=model_count.get)) if model_count else "-",
+        "fav_model": max(model_count, key=model_count.get) if model_count else "-",
+        "model_tokens": model_tok,         # label -> tokens, for the Models screen
         "heatmap": heat,
         "window_days": window_days,
     }
@@ -598,6 +682,14 @@ INDICATOR_CHIPS = {
     "major":       ("MAJOR",  CORAL),
     "critical":    ("DOWN",   RED),
     "maintenance": ("MAINT",  MUTED),
+}
+
+# Top-left data-source chip: are the gauges live from the usage endpoint, the last cached
+# live reading, or a local estimate? (set by compute_usage as usage["source"])
+SOURCE_CHIPS = {
+    "live":     ("LIVE",   GREEN),
+    "cached":   ("CACHED", AMBER),
+    "estimate": ("EST",    MUTED),
 }
 
 
@@ -840,6 +932,17 @@ def draw_claude_status(d, F):
     d.text((text_x, val_y), label, font=F["stat"], fill=color)
 
 
+def draw_data_source(d, F, source):
+    """Top-left chip: a colored dot + word telling you whether the gauges are LIVE (fresh from
+    the usage endpoint), CACHED (the last live reading, while polls fail/back off), or EST (a
+    local token estimate). Sits above the buddy, outside BUDDY_TILE, so it only repaints on
+    full frames (it changes at the same cadence as the gauges, never on the buddy animation)."""
+    label, color = SOURCE_CHIPS.get(source, SOURCE_CHIPS["estimate"])
+    x, y, dot = 14, 16, 8
+    d.ellipse([x, y, x + dot, y + dot], fill=color)
+    d.text((x + dot + 5, y - 3), label, font=F["tiny"], fill=color)
+
+
 def render_buddy_tile(t, state):
     """Just the buddy's patch (over plain background) - this is what streams each tick."""
     lx, ly, tw, th = BUDDY_TILE
@@ -856,6 +959,7 @@ def render_frame(t, usage, state):
     F = fonts()
 
     draw_buddy(d, BUDDY_CX, BUDDY_CY, BUDDY_S, t, state)            # mascot (left)
+    draw_data_source(d, F, usage.get("source", "estimate"))        # live/cached/est chip (top-left)
 
     d.text((176, 26), "Claude Code", font=F["title"], fill=FG)     # header
     status_line = {"working": "working...", "attention": "needs you!", "idle": "idle"}[state]
@@ -885,6 +989,128 @@ def render_frame(t, usage, state):
         d.text(((WIDTH - mw) / 2, 275), msg, font=F["alert"], fill=(20, 16, 14))
 
     return img.convert("RGB")
+
+
+# ---- idle stat screens (cycled when Claude is idle) --------------------------
+IDLE_PAGE_SEC = 30                           # seconds per page before cycling to the next
+IDLE_PAGES = ("overview", "models")          # what the idle rotation shows
+# stable bar colors per model, longest-prefix-first (matches MODEL_LABELS order)
+MODEL_COLORS = [
+    ("Opus 4.8", CORAL), ("Opus 4.7", (91, 141, 239)), ("Sonnet 4.6", GREEN),
+    ("Haiku 4.5", AMBER), ("Fable 5", (169, 120, 224)),
+]
+
+
+def idle_page(now=None):
+    """Which idle page to show, derived from wall-clock so the daemon and the GUI app
+    (and the panel they may share) stay in sync without passing state around."""
+    now = time.time() if now is None else now
+    return IDLE_PAGES[int(now // IDLE_PAGE_SEC) % len(IDLE_PAGES)]
+
+
+def _fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(int(n))
+
+
+def _fmt_hour(h):
+    ap = "AM" if h < 12 else "PM"
+    return f"{(h % 12) or 12} {ap}"
+
+
+def _model_color(label):
+    for k, c in MODEL_COLORS:
+        if label.startswith(k):
+            return c
+    return MUTED
+
+
+def draw_heatmap(d, heat, x, y, cell=12, gap=3):
+    """7-row (weekday) x N-col (week) activity grid, newest at bottom-right."""
+    mx = max(heat) or 1
+    for i, v in enumerate(heat):
+        cx = x + (i // 7) * (cell + gap)
+        cy = y + (i % 7) * (cell + gap)
+        d.rounded_rectangle([cx, cy, cx + cell, cy + cell], radius=2, fill=_heat_color(v / mx))
+
+
+def _stat_header(d, F, title, sub):
+    d.text((16, 12), title, font=F["title"], fill=FG)
+    d.text((16, 38), sub, font=F["small"], fill=MUTED)
+    draw_claude_status(d, F)                                   # keep the status chip top-right
+
+
+def render_stats_overview(t, stats, usage=None):
+    """Idle page 1: the headline numbers + the activity heatmap (like the app's Overview)."""
+    img = Image.new("RGBA", (WIDTH, HEIGHT), BG + (255,))
+    d = ImageDraw.Draw(img)
+    F = fonts()
+    wd = stats.get("window_days", STATS_WINDOW_DAYS)
+    _stat_header(d, F, "Activity", f"last {wd} days")
+
+    chips = [
+        ("SESSIONS",    f"{stats.get('sessions', 0):,}"),
+        ("MESSAGES",    f"{stats.get('messages', 0):,}"),
+        ("TOTAL TOKENS", _fmt_tokens(stats.get("total_tokens", 0))),
+        ("ACTIVE DAYS", f"{stats.get('active_days', 0)}"),
+        ("STREAK",      f"{stats.get('current_streak', 0)}d"),
+        ("LONGEST",     f"{stats.get('longest_streak', 0)}d"),
+        ("PEAK HOUR",   _fmt_hour(stats.get("peak_hour", 0))),
+        ("TOP MODEL",   stats.get("fav_model", "-")),
+    ]
+    col_w = (WIDTH - 32) // 4
+    for i, (cap, val) in enumerate(chips):
+        cx = 16 + (i % 4) * col_w
+        cy = 70 + (i // 4) * 60
+        d.text((cx, cy), cap, font=F["tiny"], fill=MUTED)
+        d.text((cx, cy + 14), val, font=F["stat"], fill=FG)
+
+    d.text((16, 196), "ACTIVITY", font=F["tiny"], fill=MUTED)
+    draw_heatmap(d, stats.get("heatmap", []), x=16, y=212, cell=12, gap=3)
+    return img.convert("RGB")
+
+
+def render_stats_models(t, stats, usage=None):
+    """Idle page 2: per-model token share as horizontal bars (like the app's Models tab)."""
+    img = Image.new("RGBA", (WIDTH, HEIGHT), BG + (255,))
+    d = ImageDraw.Draw(img)
+    F = fonts()
+    wd = stats.get("window_days", STATS_WINDOW_DAYS)
+    _stat_header(d, F, "Models", f"last {wd} days  -  by tokens")
+
+    items = sorted((stats.get("model_tokens") or {}).items(), key=lambda kv: kv[1], reverse=True)[:5]
+    total = sum(v for _, v in items) or 1
+    mx = max((v for _, v in items), default=1)
+    bx, bw = 150, WIDTH - 150 - 96
+    y = 78
+    if not items:
+        d.text((16, y), "no model data yet", font=F["small"], fill=MUTED)
+    for label, tok in items:
+        d.text((16, y), label, font=F["stat"], fill=FG)
+        d.rounded_rectangle([bx, y + 1, bx + bw, y + 15], radius=3, fill=TRACK)     # track
+        fill_w = max(3, int(bw * (tok / mx)))
+        d.rounded_rectangle([bx, y + 1, bx + fill_w, y + 15], radius=3, fill=_model_color(label))
+        d.text((bx + bw + 8, y - 4), f"{100 * tok / total:.0f}%", font=F["stat"], fill=FG)
+        d.text((bx + bw + 8, y + 13), _fmt_tokens(tok), font=F["tiny"], fill=MUTED)
+        y += 42
+    return img.convert("RGB")
+
+
+def render_screen(t, usage, state, stats=None):
+    """Top-level frame picker used by BOTH the daemon and the GUI app: when idle, cycle the
+    stat pages; when working/attention, show the usage dashboard. Falls back to the dashboard
+    if stats haven't been computed yet."""
+    stats = _STATS if stats is None else stats
+    if state == "idle" and stats:
+        page = idle_page()                            # wall-clock cycling (see idle_page)
+        if page == "overview":
+            return render_stats_overview(t, stats, usage)
+        if page == "models":
+            return render_stats_models(t, stats, usage)
+    return render_frame(t, usage, state)
 
 
 # ---- confetti celebration when a limit resets --------------------------------
@@ -1008,19 +1234,24 @@ def run_daemon():
     if lcd is None:
         sys.exit(1)
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))          # so stop_widget.bat can find us
+    STOP_FILE.unlink(missing_ok=True)              # clear any stale stop-request from a prior run
+    PID_FILE.write_text(str(os.getpid()))          # so stop_widget.bat / the app can find us
     threading.Thread(target=_stats_loop, args=(STATS_REFRESH_SEC,), daemon=True).start()
     threading.Thread(target=_claude_status_loop, daemon=True).start()
     t0 = time.time()
     usage = compute_usage()
     last_usage = t0
     last_state = None
+    last_idle_page = None
     prev_s, prev_w = usage["session_pct"], usage["weekly_pct"]
     prev_exact = usage["exact"]
     send_full(lcd, render_frame(0.0, usage, read_state()))   # paint everything once
     try:
         while True:
             now = time.time()
+            if STOP_FILE.exists():                           # app asked us to stop -> exit cleanly
+                STOP_FILE.unlink(missing_ok=True)
+                break
             t = now - t0
             state = read_state()
             need_full = state != last_state                  # state change -> repaint bg + colors
@@ -1046,15 +1277,29 @@ def run_daemon():
                     celebrate(lcd, usage, label)
                     last_state = None
                     continue
-            if need_full:
-                send_full(lcd, render_frame(t, usage, state))
+            if state == "idle" and _STATS:               # idle -> cycle static stat pages
+                page = idle_page(now)
+                if need_full or page != last_idle_page:
+                    send_full(lcd, render_screen(t, usage, state))
+                    last_idle_page = page
+                # else: the stat page is static this tick -> nothing to stream
             else:
-                send_tile(lcd, render_buddy_tile(t, state), *BUDDY_TILE)  # fast: just the buddy
+                last_idle_page = None
+                if need_full:
+                    send_full(lcd, render_frame(t, usage, state))
+                else:
+                    send_tile(lcd, render_buddy_tile(t, state), *BUDDY_TILE)  # fast: just the buddy
             time.sleep(FRAME_SEC)
     except KeyboardInterrupt:
-        lcd.Clear()
-        lcd.ScreenOff()
+        pass
     finally:
+        # Clean shutdown (Ctrl-C, stop-request, or error): blank the panel so a restart never
+        # finds it wedged mid-frame, and drop the PID file so the app/stop script see us gone.
+        try:
+            lcd.Clear()
+            lcd.ScreenOff()
+        except Exception:
+            pass
         try: PID_FILE.unlink()
         except OSError: pass
 
@@ -1064,11 +1309,13 @@ def run_preview():
     mock = {"session_tokens": 5_021_440, "session_pct": 0.70,
             "weekly_tokens": 74_400_000, "weekly_pct": 0.37,
             "reset_in": timedelta(hours=2, minutes=14),
-            "weekly_reset_in": timedelta(days=3, hours=5), "exact": True}
+            "weekly_reset_in": timedelta(days=3, hours=5), "exact": True, "source": "live"}
     _STATS = compute_stats()                              # real footer stats for the mockup
     for state in ("idle", "working", "attention"):
         render_frame(0.4, mock, state).save(f"preview_{state}.png")
     render_frame(3.55, mock, "idle").save("preview_idle_blink.png")  # caught mid-blink
+    render_stats_overview(0.4, _STATS, mock).save("preview_stats_overview.png")
+    render_stats_models(0.4, _STATS, mock).save("preview_stats_models.png")
     print("wrote preview_*.png")
 
 
