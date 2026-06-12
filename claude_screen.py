@@ -140,6 +140,11 @@ def fonts():
             "tiny":  load_font(11),               # stat captions
             "stat":  load_font(15, bold=True),    # stat values
             "statbig": load_font(24, bold=True),  # hero stat values
+            # idle stat screens (Activity / Models) — ~2px larger than the dashboard equivalents
+            "s_title": load_font(22, bold=True),
+            "s_sub":   load_font(15),
+            "s_cap":   load_font(13),
+            "s_val":   load_font(17, bold=True),
         }
     return FONTS
 
@@ -545,7 +550,8 @@ def compute_usage():
 
 
 # ---- dashboard-style stats (heavy scan; the daemon refreshes these on a background thread) ----
-STATS_WINDOW_DAYS = 49                       # history window for stats + heatmap (7x7 grid)
+STATS_WINDOW_DAYS = 49                       # window for the headline numbers (streaks, totals, models)
+HEATMAP_WEEKS = 26                           # the Activity heatmap spans this many weeks (fills the row)
 MODEL_LABELS = [                             # longest-prefix-first, so 4-7 doesn't shadow 4-5
     ("claude-opus-4-8", "Opus 4.8"), ("claude-opus-4-7", "Opus 4.7"),
     ("claude-sonnet-4-6", "Sonnet 4.6"), ("claude-haiku-4-5", "Haiku 4.5"),
@@ -567,10 +573,13 @@ def compute_stats(window_days=STATS_WINDOW_DAYS):
     the daemon runs this off the render loop. Day/hour buckets use the machine's local tz."""
     now = datetime.now(timezone.utc)
     tz = datetime.now().astimezone().tzinfo
-    cut = now - timedelta(days=window_days)
-    cut_ts = cut.timestamp()
+    heat_days = HEATMAP_WEEKS * 7
+    cut_stats = now - timedelta(days=window_days)        # headline numbers use this narrow window
+    cut_heat = now - timedelta(days=heat_days + 7)       # heatmap window (+7 covers weekday alignment)
+    cut_scan = min(cut_stats, cut_heat)                  # ...so scan the wider of the two
+    cut_ts = cut_scan.timestamp()
     seen, models = {}, {}                    # msg id -> (ts, tokens) ; msg id -> model
-    files_seen = set()                       # distinct transcripts with in-window activity (~sessions)
+    files_seen = set()                       # distinct transcripts active in the stats window (~sessions)
     if PROJECTS_DIR.exists():
         for fp in glob.glob(str(PROJECTS_DIR / "**" / "*.jsonl"), recursive=True):
             try:
@@ -592,40 +601,47 @@ def compute_stats(window_days=STATS_WINDOW_DAYS):
                         if not u:
                             continue
                         ts = _ts(rec)
-                        if ts is None or ts < cut:
+                        if ts is None or ts < cut_scan:
                             continue
                         toks = sum(int(u.get(k, 0) or 0) for k in COUNT_FIELDS)
                         mid = msg.get("id") or f"{fp}:{rec.get('uuid')}"
                         if mid not in seen or toks > seen[mid][1]:
                             seen[mid] = (ts, toks)
                             models[mid] = msg.get("model")
-                        files_seen.add(fp)
+                        if ts >= cut_stats:
+                            files_seen.add(fp)
             except Exception:
                 continue
 
-    day_tok = {}                             # local date -> tokens
-    hour_msgs = [0] * 24                      # local hour -> message count
-    model_count = {}                         # model label -> message count
-    model_tok = {}                           # model label -> tokens (for the Models screen)
+    day_tok = {}                             # local date -> tokens (heatmap window)
+    hour_msgs = [0] * 24                      # local hour -> message count (stats window)
+    model_count = {}                         # model label -> message count (stats window)
+    model_tok = {}                           # model label -> tokens (stats window, for the Models screen)
+    dayset = set()                           # active local dates (stats window, for streaks)
+    messages = 0
+    total_tokens = 0
     for mid, (ts, toks) in seen.items():
         lt = ts.astimezone(tz)
-        day_tok[lt.date()] = day_tok.get(lt.date(), 0) + toks
-        hour_msgs[lt.hour] += 1
-        m = models.get(mid)
-        if m:
-            lbl = _model_label(m)
-            model_count[lbl] = model_count.get(lbl, 0) + 1
-            model_tok[lbl] = model_tok.get(lbl, 0) + toks
+        if ts >= cut_heat:
+            day_tok[lt.date()] = day_tok.get(lt.date(), 0) + toks
+        if ts >= cut_stats:
+            messages += 1
+            total_tokens += toks
+            dayset.add(lt.date())
+            hour_msgs[lt.hour] += 1
+            m = models.get(mid)
+            if m:
+                lbl = _model_label(m)
+                model_count[lbl] = model_count.get(lbl, 0) + 1
+                model_tok[lbl] = model_tok.get(lbl, 0) + toks
 
-    messages = len(seen)
-    dayset = set(day_tok)
     today = datetime.now(tz).date()
     # current streak: consecutive active days up to today (tolerate today not started yet)
     cur, d = 0, (today if today in dayset else today - timedelta(days=1))
     while d in dayset:
         cur += 1
         d -= timedelta(days=1)
-    # longest streak within the window
+    # longest streak within the stats window
     longest = 0
     for d0 in dayset:
         if (d0 - timedelta(days=1)) not in dayset:       # a run starts here
@@ -634,13 +650,20 @@ def compute_stats(window_days=STATS_WINDOW_DAYS):
                 run += 1
                 d += timedelta(days=1)
             longest = max(longest, run)
-    # heatmap: oldest..newest daily tokens for the trailing window
-    heat = [day_tok.get(today - timedelta(days=window_days - 1 - i), 0) for i in range(window_days)]
+    # heatmap: a weekday-aligned calendar grid like the desktop app — columns are weeks (oldest at
+    # left), rows are weekday (Mon at top .. Sun at bottom), newest week at the right. Future days in
+    # the current week render empty. Drawn with i//7 = column, i%7 = row.
+    wd = today.weekday()                                  # Mon=0 .. Sun=6
+    heat = []
+    for col in range(HEATMAP_WEEKS):
+        for row in range(7):
+            dte = today - timedelta(days=(wd - row) + (HEATMAP_WEEKS - 1 - col) * 7)
+            heat.append(day_tok.get(dte, 0) if dte <= today else 0)
 
     return {
         "sessions": len(files_seen),
         "messages": messages,
-        "total_tokens": sum(t for _, t in seen.values()),
+        "total_tokens": total_tokens,
         "active_days": len(dayset),
         "current_streak": cur,
         "longest_streak": longest,
@@ -877,10 +900,6 @@ def draw_buddy(d, cx, cy, s, t, state):
     _draw_overhead(d, state, cx + dx, ye[0], s, t)           # thought above the head
 
 
-def _fmt_hour(h):
-    return f"{(h % 12) or 12} {'AM' if h < 12 else 'PM'}"
-
-
 def _heat_color(frac):
     """Empty cells = TRACK; activity ramps toward CORAL (with a floor so any day shows)."""
     if frac <= 0:
@@ -894,8 +913,8 @@ def draw_stats(d, stats, F):
     y0 = 230
     d.line([(14, y0), (WIDTH - 14, y0)], fill=TRACK, width=1)        # divider
 
-    # square heatmap (hero): 7 rows (weekday) x 7 cols (weeks), newest at bottom-right
-    heat = stats["heatmap"]
+    # square heatmap (hero): last 7 weeks only (the full wide grid is for the idle Activity page)
+    heat = stats["heatmap"][-49:]
     mx = max(heat) or 1
     cell, gap, hx, hy = 10, 2, 16, 236
     for i, v in enumerate(heat):
@@ -1028,18 +1047,18 @@ def _model_color(label):
     return MUTED
 
 
-def draw_heatmap(d, heat, x, y, cell=12, gap=3):
+def draw_heatmap(d, heat, x, y, cell_w=12, cell_h=12, gap=2):
     """7-row (weekday) x N-col (week) activity grid, newest at bottom-right."""
     mx = max(heat) or 1
     for i, v in enumerate(heat):
-        cx = x + (i // 7) * (cell + gap)
-        cy = y + (i % 7) * (cell + gap)
-        d.rounded_rectangle([cx, cy, cx + cell, cy + cell], radius=2, fill=_heat_color(v / mx))
+        cx = x + (i // 7) * (cell_w + gap)
+        cy = y + (i % 7) * (cell_h + gap)
+        d.rounded_rectangle([cx, cy, cx + cell_w, cy + cell_h], radius=2, fill=_heat_color(v / mx))
 
 
 def _stat_header(d, F, title, sub):
-    d.text((16, 12), title, font=F["title"], fill=FG)
-    d.text((16, 38), sub, font=F["small"], fill=MUTED)
+    d.text((16, 12), title, font=F["s_title"], fill=FG)
+    d.text((16, 40), sub, font=F["s_sub"], fill=MUTED)
     draw_claude_status(d, F)                                   # keep the status chip top-right
 
 
@@ -1064,12 +1083,19 @@ def render_stats_overview(t, stats, usage=None):
     col_w = (WIDTH - 32) // 4
     for i, (cap, val) in enumerate(chips):
         cx = 16 + (i % 4) * col_w
-        cy = 70 + (i // 4) * 60
-        d.text((cx, cy), cap, font=F["tiny"], fill=MUTED)
-        d.text((cx, cy + 14), val, font=F["stat"], fill=FG)
+        cy = 74 + (i // 4) * 60
+        d.text((cx, cy), cap, font=F["s_cap"], fill=MUTED)
+        d.text((cx, cy + 16), val, font=F["s_val"], fill=FG)
 
-    d.text((16, 196), "ACTIVITY", font=F["tiny"], fill=MUTED)
-    draw_heatmap(d, stats.get("heatmap", []), x=16, y=212, cell=12, gap=3)
+    d.text((16, 190), "ACTIVITY", font=F["s_cap"], fill=MUTED)
+    # heatmap stretches across the full row width; cells sized to fit the columns + height
+    heat = stats.get("heatmap", [])
+    x0, gap = 16, 2
+    weeks = max(1, -(-len(heat) // 7))                        # ceil(len/7) = number of columns
+    avail_w = WIDTH - 2 * x0
+    cell_w = max(3, (avail_w - (weeks - 1) * gap) // weeks)
+    cell_h = (HEIGHT - 212 - 8 - 6 * gap) // 7                # fit 7 rows in the remaining height
+    draw_heatmap(d, heat, x0, 212, cell_w=cell_w, cell_h=cell_h, gap=gap)
     return img.convert("RGB")
 
 
@@ -1084,18 +1110,18 @@ def render_stats_models(t, stats, usage=None):
     items = sorted((stats.get("model_tokens") or {}).items(), key=lambda kv: kv[1], reverse=True)[:5]
     total = sum(v for _, v in items) or 1
     mx = max((v for _, v in items), default=1)
-    bx, bw = 150, WIDTH - 150 - 96
-    y = 78
+    bx, bw = 154, WIDTH - 154 - 100
+    y = 82
     if not items:
-        d.text((16, y), "no model data yet", font=F["small"], fill=MUTED)
+        d.text((16, y), "no model data yet", font=F["s_sub"], fill=MUTED)
     for label, tok in items:
-        d.text((16, y), label, font=F["stat"], fill=FG)
-        d.rounded_rectangle([bx, y + 1, bx + bw, y + 15], radius=3, fill=TRACK)     # track
+        d.text((16, y), label, font=F["s_val"], fill=FG)
+        d.rounded_rectangle([bx, y + 1, bx + bw, y + 17], radius=3, fill=TRACK)     # track
         fill_w = max(3, int(bw * (tok / mx)))
-        d.rounded_rectangle([bx, y + 1, bx + fill_w, y + 15], radius=3, fill=_model_color(label))
-        d.text((bx + bw + 8, y - 4), f"{100 * tok / total:.0f}%", font=F["stat"], fill=FG)
-        d.text((bx + bw + 8, y + 13), _fmt_tokens(tok), font=F["tiny"], fill=MUTED)
-        y += 42
+        d.rounded_rectangle([bx, y + 1, bx + fill_w, y + 17], radius=3, fill=_model_color(label))
+        d.text((bx + bw + 8, y - 4), f"{100 * tok / total:.0f}%", font=F["s_val"], fill=FG)
+        d.text((bx + bw + 8, y + 16), _fmt_tokens(tok), font=F["s_cap"], fill=MUTED)
+        y += 44
     return img.convert("RGB")
 
 
