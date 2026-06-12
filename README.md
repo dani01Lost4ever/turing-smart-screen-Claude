@@ -12,16 +12,29 @@ It answers the two questions you keep asking mid-session: *how much of my 5-hour
 
 ## What it shows
 
-- **5h session & weekly gauges** — exact utilization percentages and reset countdowns, pulled from `https://api.anthropic.com/api/oauth/usage` (the data behind `/usage`), polled ~once a minute. If that's ever unreachable it falls back to estimating from local logs and labels the value `(est)`.
-- **The buddy** — a clay-colored mascot that is **working** (active), **idle** (calm), or **attention** (flashing alert when Claude needs your input). Driven by Claude Code lifecycle hooks.
+- **5h session & weekly gauges** — exact utilization percentages and reset countdowns, pulled from `https://api.anthropic.com/api/oauth/usage` (the data behind `/usage`). A small **LIVE / CACHED / EST** dot in the top-left tells you whether the numbers are fresh from the endpoint, the last cached reading, or a local estimate.
+- **The buddy** — a clay-colored mascot that is **working**, **idle**, or **attention** (a flashing **"NEEDS YOU"** alert when Claude asks you a question). "Working" is detected from live transcript activity, so it stays accurate even mid-task — no reliance on hooks firing.
+- **Idle stat screens** — when Claude is idle, the screen cycles through dashboard-style stats (see below) and snaps back to the gauges the moment work resumes.
 - **Confetti** 🎉 when a limit resets.
 - **status.claude.com strip** — overall health + per-component dots (claude.ai, Console, API, Code, …), live from the Statuspage API.
-- **Session stats** — current streak, favorite model, and a usage heatmap, parsed from your local `~/.claude/projects/**/*.jsonl`.
+
+## When Claude is idle
+
+The panel cycles through two stat pages every 30 seconds, parsed from your local `~/.claude/projects/**/*.jsonl`:
+
+| Activity | Models |
+|:---:|:---:|
+| ![Activity stats page](docs/screen-activity.png) | ![Models stats page](docs/screen-models.png) |
+
+**Activity** shows sessions, messages, total tokens, active days, current/longest streak, peak hour, favorite model, and a weekday-aligned activity heatmap. **Models** breaks down token usage per model. The moment Claude starts working again, the screen returns to the live usage gauges.
 
 ## Two ways to run it
 
 ### 1. Desktop app (`claude_app.py`)
-A PySide6 window with a live preview, a **State** override menu, a **Theme** editor (palette, weekly-reset anchor, token-budget calibration, brightness) with Save / Undo / Redo, the status strip, and an optional **Connect to panel** toggle to drive the physical screen.
+A PySide6 window with a live preview, a **State** override menu, a **Theme** editor (palette, weekly-reset anchor, token-budget calibration, brightness) with Save / Undo / Redo, and the status strip. The toolbar also has:
+- **Connect to panel** — drive the physical screen from the app (takes the panel over from the background daemon).
+- **Refresh** (F5) — force an immediate live usage fetch.
+- **Restart service** — cleanly restart the background daemon (the `ClaudeStatusBuddy` task) so it picks up updates, without wedging the panel.
 
 ```bat
 start_app.bat            REM or:  pyw -3.13 claude_app.py
@@ -67,6 +80,8 @@ python install_hooks.py --remove        REM to undo
 
 `set_state.py` is the lightweight hook entry point — it just writes `~/.claude/claude-screen-state.json`, which the daemon and the app both read. The `attention` alert **persists until you respond** (it doesn't auto-decay). Claude Code snapshots hooks at startup, so restart your session (or run `/hooks`) after installing.
 
+The hooks mainly drive the **attention** alert; **working / idle** is detected independently from transcript activity, so the buddy stays correct even if the hooks are stale or haven't been reloaded yet.
+
 ### Auto-start at login (optional, Windows)
 ```powershell
 powershell -ExecutionPolicy Bypass -File install_autostart.ps1     # registers a "ClaudeStatusBuddy" scheduled task
@@ -76,6 +91,8 @@ powershell -ExecutionPolicy Bypass -File uninstall_autostart.ps1
 ## How usage is measured
 
 The gauges use Claude Code's own OAuth token (from `~/.claude/.credentials.json`) to call the usage endpoint, refreshing the token when it expires (and writing the rotated token back, so the CLI stays logged in). This is why the percentages match `/usage` exactly instead of drifting like a token-count estimate would.
+
+Polling is deliberately gentle (every 5 min, with cross-process dedupe via a shared cache and back-off on HTTP 429) since the endpoint rate-limits. Each good reading is cached to disk, so a restart or a brief outage shows the last live value (the **CACHED** dot) rather than dropping to a far-off estimate — and the **Refresh** button forces an immediate fetch when you want the exact number now.
 
 Diagnostic — print the raw endpoint response any time a gauge looks off:
 ```bat
